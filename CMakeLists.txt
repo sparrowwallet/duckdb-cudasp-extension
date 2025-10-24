@@ -28,6 +28,8 @@ set(CMAKE_CUDA_ARCHITECTURES 80 86 89)
 # Enable gECC optimizations
 add_compile_definitions(GECC_QAPW_OPT_COLUMN_MAJORED_INPUTS)
 add_compile_definitions(PERSISTENT_L2_CACHE)
+add_compile_definitions(OVERFLOW)
+add_compile_definitions(SPPARK_32)
 
 # Generate gECC constants (required for compilation)
 set(GECC_GENERATED_DIR "${CMAKE_CURRENT_BINARY_DIR}/gecc_generated")
@@ -63,7 +65,7 @@ add_custom_target(gecc_constants DEPENDS ${GECC_GENERATED_HEADERS})
 include_directories(${GECC_GENERATED_DIR})
 
 set(EXTENSION_SOURCES
-    src/cudasp_extension.cpp
+    src/cudasp_extension.cu
     src/cudasp_gpu.cu
 )
 
@@ -79,6 +81,7 @@ target_link_libraries(${EXTENSION_NAME} OpenSSL::SSL OpenSSL::Crypto CUDA::cudar
 target_link_libraries(${LOADABLE_EXTENSION_NAME} OpenSSL::SSL OpenSSL::Crypto CUDA::cudart)
 
 # Set CUDA-specific compile options
+set_source_files_properties(src/cudasp_extension.cu PROPERTIES LANGUAGE CUDA)
 set_source_files_properties(src/cudasp_gpu.cu PROPERTIES LANGUAGE CUDA)
 target_compile_options(${EXTENSION_NAME} PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:--expt-relaxed-constexpr>)
 target_compile_options(${LOADABLE_EXTENSION_NAME} PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:--expt-relaxed-constexpr>)

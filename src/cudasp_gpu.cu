@@ -3,115 +3,62 @@
 
 #include "gecc.h"
 #include "gecc/arith.h"
+#include "gecc/ecdsa.h"
 
 using namespace gecc;
 using namespace arith;
+using namespace ecdsa;
 
-// Define field and EC types for secp256k1
+// Define field and EC types for secp256k1 (matching gECC test naming)
 // secp256k1 has a=0, so use DBL_FLAG=1 for the a=0 optimized doubling formula
-DEFINE_SECP256K1_FP(Fq_SECP256K1, FqSECP256K1, u32, 32, LayoutT<1>, 8, gecc::arith::MONTFLAG::SOS, gecc::arith::CURVEFLAG::DEFAULT);
-DEFINE_EC(G1_EC, G1SECP256K1, Fq_SECP256K1, SECP256K1_CURVE, 1);
+DEFINE_SECP256K1_FP(Fq_SECP256K1_1, FqSECP256K1, u32, 32, LayoutT<1>, 8, gecc::arith::MONTFLAG::SOS, gecc::arith::CURVEFLAG::DEFAULT);
+DEFINE_FP(Fq_SECP256K1_n, FqSECP256K1_n, u32, 32, LayoutT<1>, 8);
+DEFINE_EC(G1_1, G1SECP256K1, Fq_SECP256K1_1, SECP256K1_CURVE, 1);
+DEFINE_ECDSA(ECDSA_Solver, G1_1_G1SECP256K1, Fq_SECP256K1_1, Fq_SECP256K1_n);
 
-using Field = Fq_SECP256K1;
-using ECPoint = G1_EC_G1SECP256K1;  // DEFINE_EC creates TYPE_NAME_CURVE_NAME
+using Field = Fq_SECP256K1_1;
+using Order = Fq_SECP256K1_n;
+using ECPoint = G1_1_G1SECP256K1;  // DEFINE_EC creates TYPE_NAME_CURVE_NAME
+using Solver = ECDSA_Solver;
 
-// Kernel to convert points to Montgomery form (similar to processScalarPoint in gECC)
-template <typename EC, typename Field>
-__global__ void ProcessPointsKernel(
-    typename Field::Base *points_x,
-    typename Field::Base *points_y,
-    uint32_t count) {
-
-    uint32_t idx = blockIdx.x * blockDim.x + threadIdx.x;
-    if (idx >= count) return;
-
-    const u32 slot_idx = LayoutT<1>::global_slot_idx();
-    const u32 lane_idx = LayoutT<1>::lane_idx();
-
-    // Load point coordinates
-    Field px, py;
-    px.load_arbitrary(points_x, count, slot_idx, lane_idx);
-    py.load_arbitrary(points_y, count, slot_idx, lane_idx);
-
-    // Convert to Montgomery form
-    px.inplace_to_montgomery();
-    py.inplace_to_montgomery();
-
-    // Store back
-    px.store_arbitrary(points_x, count, slot_idx, lane_idx);
-    py.store_arbitrary(points_y, count, slot_idx, lane_idx);
-}
-
-// CUDA kernel: Batch scalar multiplication followed by int64 extraction and list comparison
-// Each thread computes: result_int64 = extract_int64(scalar * point[i]), then checks if result_int64 is in outputs[i]
-__global__ void BatchScanKernel(
-    const uint32_t *input_points_x,      // X coordinates of input tweak keys (column-major if GECC_QAPW_OPT_COLUMN_MAJORED_INPUTS)
-    const uint32_t *input_points_y,      // Y coordinates of input tweak keys
-    const uint32_t *scalar,              // Shared scalar (scan_private_key) - 8 u32 limbs
+// Kernel to check computed results against outputs and set match flags
+// Results are extracted from solver.R0 which has interleaved X,Y format (not Affine point format)
+__global__ void CheckMatchesKernel(
+    const uint32_t *result_x_coords,     // Extracted X coordinates (in Montgomery form, raw u32 limbs)
     const int64_t *outputs,              // Flattened outputs array
     const uint32_t *output_offsets,      // Offset into outputs for each row
     const uint32_t *output_lengths,      // Length of outputs list for each row
     uint8_t *match_flags,                // Output: 1 if match found, 0 otherwise
     uint32_t count) {                    // Number of points to process
 
-    const u32 slot_idx = LayoutT<1>::global_slot_idx();
-    const u32 lane_idx = LayoutT<1>::lane_idx();
+    const u32 instance = blockIdx.x * blockDim.x + threadIdx.x;
 
-    if (slot_idx >= count) return;
+    if (instance >= count) return;
 
-    // Load input point coordinates
-    Field px, py;
-    px.load_arbitrary(input_points_x, count, slot_idx, lane_idx);
-    py.load_arbitrary(input_points_y, count, slot_idx, lane_idx);
+    constexpr u32 field_limbs = 8;  // 8 u32 limbs for 256-bit field
 
-    // Load scalar (shared across all threads, but each thread loads it)
-    Field scalar_field;
-    // For shared scalar, we broadcast it to all threads
-    // Since scalar is not in column-major format, we need to load it specially
-    #pragma unroll
-    for (u32 i = 0; i < 8; ++i) {
-        scalar_field.digits[i] = scalar[i];
+    // Load X coordinate (raw u32 limbs in Montgomery form)
+    // result_x_coords is a flat array: point i's X is at [i * field_limbs]
+    const uint32_t *x_montgomery = result_x_coords + instance * field_limbs;
+
+    // Convert from Montgomery form to normal form
+    // Load into Field type for Montgomery conversion
+    Field x_mont;
+    for (u32 i = 0; i < field_limbs; ++i) {
+        x_mont.digits[i] = x_montgomery[i];
     }
 
-    // Convert to Jacobian coordinates (Z=1 in Montgomery form)
-    ECPoint base_jac;
-    base_jac.x = px;
-    base_jac.y = py;
-    base_jac.z = Field::mont_one();
-
-    // Perform scalar multiplication using double-and-add
-    ECPoint result_jac = ECPoint::zero();
-
-    for (int bit = Field::BITS - 1; bit >= 0; --bit) {
-        result_jac = result_jac.dbl();
-
-        // Check if bit is set in scalar
-        u32 limb_idx = bit / 32;
-        u32 bit_pos = bit % 32;
-        bool bit_set = (scalar_field.digits[limb_idx] >> bit_pos) & 1;
-
-        if (bit_set) {
-            result_jac = result_jac + base_jac;
-        }
-    }
-
-    // Convert result back to affine coordinates
-    Field result_z_inv = result_jac.z.inverse();
-    Field result_z_inv_sq = result_z_inv * result_z_inv;
-    Field result_x = result_jac.x * result_z_inv_sq;
-
-    // Extract int64 from result point (lower 64 bits of x-coordinate)
-    // The x-coordinate is in Montgomery form, so convert to normal form first
-    Field result_x_normal = result_x.from_montgomery();
+    Field x_normal = x_mont.from_montgomery();
 
     // Extract lower 64 bits (first 2 u32 limbs in little-endian)
-    int64_t computed_value = static_cast<int64_t>(result_x_normal.digits[0]) |
-                             (static_cast<int64_t>(result_x_normal.digits[1]) << 32);
+    uint64_t computed_value_u64 = static_cast<uint64_t>(x_normal.digits[0]) |
+                                  (static_cast<uint64_t>(x_normal.digits[1]) << 32);
+    int64_t computed_value = static_cast<int64_t>(computed_value_u64);
 
     // Check if computed_value is in the outputs list for this row
     bool found = false;
-    uint32_t offset = output_offsets[slot_idx];
-    uint32_t length = output_lengths[slot_idx];
+    uint32_t offset = output_offsets[instance];
+    uint32_t length = output_lengths[instance];
 
     for (uint32_t j = 0; j < length; ++j) {
         if (outputs[offset + j] == computed_value) {
@@ -121,153 +68,282 @@ __global__ void BatchScanKernel(
     }
 
     // Write match flag
-    match_flags[slot_idx] = found ? 1 : 0;
+    match_flags[instance] = found ? 1 : 0;
 }
 
-// Host function to setup managed memory and launch kernels
-// This uses cudaMallocManaged and optimizations similar to gECC's ec_pmul_random_init
-extern "C" int LaunchBatchScan(
-    uint32_t **managed_points_x,      // Will allocate managed memory
-    uint32_t **managed_points_y,      // Will allocate managed memory
+// Per-batch state to hold auxiliary data between LaunchBatchScan and RunBatchScanKernels
+struct BatchScanState {
+    int64_t *d_outputs;
+    uint32_t *d_output_offsets;
+    uint32_t *d_output_lengths;
+    Solver *solver;  // ECDSA solver instance
+    uint32_t count;
+};
+
+// Host function to initialize solver and prepare for EC multiplication
+// This follows the pattern from gECC's ec_pmul_random_init, but with our specific data
+// Returns an opaque handle to BatchScanState (cast to void*) for thread-safe operation
+extern "C" void* LaunchBatchScan(
+    uint32_t **managed_points_x,      // Will allocate managed memory for input points
+    uint32_t **managed_points_y,      // Will allocate managed memory for input points
     const uint32_t *h_scalar,         // Host scalar (8 u32 limbs)
     const int64_t *h_outputs,         // Host outputs array
     const uint32_t *h_output_offsets, // Host output offsets
     const uint32_t *h_output_lengths, // Host output lengths
-    uint8_t **managed_match_flags,    // Will allocate managed memory
+    uint8_t **managed_match_flags,    // Will allocate managed memory for match results
     uint32_t count,
     size_t outputs_size) {
 
-    // Initialize field parameters (must be called before using field operations)
-    Fq_SECP256K1::initialize();
+    // Initialize field and solver once per program (not per batch)
+    static bool initialized = false;
+    if (!initialized) {
+        Solver::initialize();
+        initialized = true;
+    }
 
-    // Allocate managed memory (accessible from both CPU and GPU)
+    // Allocate per-batch state (thread-safe)
+    BatchScanState *state = new BatchScanState();
+    state->d_outputs = nullptr;
+    state->d_output_offsets = nullptr;
+    state->d_output_lengths = nullptr;
+    state->solver = nullptr;
+    state->count = count;
+
+    // Allocate managed memory for point coordinates (caller will fill these)
     cudaError_t err;
     err = cudaMallocManaged(managed_points_x, Field::SIZE * count);
-    if (err != cudaSuccess) return -1;
+    if (err != cudaSuccess) {
+        delete state;
+        return nullptr;
+    }
 
     err = cudaMallocManaged(managed_points_y, Field::SIZE * count);
     if (err != cudaSuccess) {
         cudaFree(*managed_points_x);
-        return -1;
+        delete state;
+        return nullptr;
     }
 
-    uint32_t *d_scalar;
-    err = cudaMallocManaged(&d_scalar, Field::SIZE);
+    // Allocate outputs metadata
+    err = cudaMallocManaged(&state->d_outputs, outputs_size * sizeof(int64_t));
     if (err != cudaSuccess) {
         cudaFree(*managed_points_x);
         cudaFree(*managed_points_y);
-        return -1;
+        delete state;
+        return nullptr;
     }
 
-    int64_t *d_outputs;
-    err = cudaMallocManaged(&d_outputs, outputs_size * sizeof(int64_t));
+    err = cudaMallocManaged(&state->d_output_offsets, count * sizeof(uint32_t));
     if (err != cudaSuccess) {
         cudaFree(*managed_points_x);
         cudaFree(*managed_points_y);
-        cudaFree(d_scalar);
-        return -1;
+        cudaFree(state->d_outputs);
+        delete state;
+        return nullptr;
     }
 
-    uint32_t *d_output_offsets, *d_output_lengths;
-    err = cudaMallocManaged(&d_output_offsets, count * sizeof(uint32_t));
+    err = cudaMallocManaged(&state->d_output_lengths, count * sizeof(uint32_t));
     if (err != cudaSuccess) {
         cudaFree(*managed_points_x);
         cudaFree(*managed_points_y);
-        cudaFree(d_scalar);
-        cudaFree(d_outputs);
-        return -1;
-    }
-
-    err = cudaMallocManaged(&d_output_lengths, count * sizeof(uint32_t));
-    if (err != cudaSuccess) {
-        cudaFree(*managed_points_x);
-        cudaFree(*managed_points_y);
-        cudaFree(d_scalar);
-        cudaFree(d_outputs);
-        cudaFree(d_output_offsets);
-        return -1;
+        cudaFree(state->d_outputs);
+        cudaFree(state->d_output_offsets);
+        delete state;
+        return nullptr;
     }
 
     err = cudaMallocManaged(managed_match_flags, count * sizeof(uint8_t));
     if (err != cudaSuccess) {
         cudaFree(*managed_points_x);
         cudaFree(*managed_points_y);
-        cudaFree(d_scalar);
-        cudaFree(d_outputs);
-        cudaFree(d_output_offsets);
-        cudaFree(d_output_lengths);
+        cudaFree(state->d_outputs);
+        cudaFree(state->d_output_offsets);
+        cudaFree(state->d_output_lengths);
+        delete state;
+        return nullptr;
+    }
+
+    // Copy outputs metadata
+    memcpy(state->d_outputs, h_outputs, outputs_size * sizeof(int64_t));
+    memcpy(state->d_output_offsets, h_output_offsets, count * sizeof(uint32_t));
+    memcpy(state->d_output_lengths, h_output_lengths, count * sizeof(uint32_t));
+
+    // Create fresh solver for this batch
+    state->solver = new Solver();
+
+    return static_cast<void*>(state);
+}
+
+// Run the GPU kernels after caller has filled managed memory
+// This follows the pattern from ecdsa_ec_unknown_pmul.cu test
+extern "C" int RunBatchScanKernels(
+    void *state_handle,              // Opaque handle from LaunchBatchScan
+    uint32_t *managed_points_x,
+    uint32_t *managed_points_y,
+    const uint32_t *h_scalar,        // Scalar for all multiplications
+    uint8_t *managed_match_flags,
+    uint32_t count) {
+
+    BatchScanState *state = static_cast<BatchScanState*>(state_handle);
+    if (!state || !state->solver) {
+        printf("Error: Invalid state or solver not initialized\n");
         return -1;
     }
 
-    // Copy scalar and auxiliary data (host->managed can be done directly)
-    memcpy(d_scalar, h_scalar, Field::SIZE);
-    memcpy(d_outputs, h_outputs, outputs_size * sizeof(int64_t));
-    memcpy(d_output_offsets, h_output_offsets, count * sizeof(uint32_t));
-    memcpy(d_output_lengths, h_output_lengths, count * sizeof(uint32_t));
-
-    // Points data should already be copied by caller to *managed_points_x and *managed_points_y
+    Solver *solver = state->solver;
 
     cudaDeviceSynchronize();
 
-    // Process points: convert to Montgomery form on GPU
-    int threads_per_block = 256;
-    int num_blocks = (count + threads_per_block - 1) / threads_per_block;
-    ProcessPointsKernel<ECPoint, Field><<<num_blocks, threads_per_block>>>(*managed_points_x, *managed_points_y, count);
-    cudaDeviceSynchronize();
+    // Prepare data in the format expected by ec_pmul_random_init
+    // MAX_LIMBS is defined in gECC as 64 (maximum array size)
+    // For secp256k1 (256-bit), we use 4 u64 limbs, but arrays must be size MAX_LIMBS
+    constexpr u32 MAX_LIMBS = 64;
+    constexpr u32 USED_LIMBS = 4;  // 256 bits = 4 u64 limbs
 
-#ifdef PERSISTENT_L2_CACHE
-    // Optional: Set up persistent L2 cache for better performance (CUDA 11.0+)
-    // This helps keep frequently accessed data in L2 cache
-    #if CUDART_VERSION >= 11000
-        cudaDeviceProp device_prop;
-        int current_device = 0;
-        cudaGetDevice(&current_device);
-        cudaGetDeviceProperties(&device_prop, current_device);
-        size_t accessPolicyMaxWindowSize = device_prop.accessPolicyMaxWindowSize;
+    // Allocate host arrays in the format ec_pmul_random_init expects
+    u64 (*h_scalars)[MAX_LIMBS] = new u64[count][MAX_LIMBS];
+    u64 (*h_keys_x)[MAX_LIMBS] = new u64[count][MAX_LIMBS];
+    u64 (*h_keys_y)[MAX_LIMBS] = new u64[count][MAX_LIMBS];
 
-        if (accessPolicyMaxWindowSize > 0) {
-            size_t needed_bytes_pers_l2_cache = count * Field::SIZE;
-            size_t setted_pers_l2_cache = std::max(needed_bytes_pers_l2_cache,
-                                                     std::min(needed_bytes_pers_l2_cache, accessPolicyMaxWindowSize));
+    // Zero-initialize arrays
+    memset(h_scalars, 0, count * MAX_LIMBS * sizeof(u64));
+    memset(h_keys_x, 0, count * MAX_LIMBS * sizeof(u64));
+    memset(h_keys_y, 0, count * MAX_LIMBS * sizeof(u64));
 
-            cudaStreamAttrValue stream_attribute;
-            stream_attribute.accessPolicyWindow.base_ptr = reinterpret_cast<void*>(*managed_points_x);
-            stream_attribute.accessPolicyWindow.num_bytes = setted_pers_l2_cache;
-            stream_attribute.accessPolicyWindow.hitRatio = 1.0;
-            stream_attribute.accessPolicyWindow.hitProp = cudaAccessPropertyPersisting;
-            stream_attribute.accessPolicyWindow.missProp = cudaAccessPropertyStreaming;
-            cudaStreamSetAttribute(0, cudaStreamAttributeAccessPolicyWindow, &stream_attribute);
+    // Fill scalar array (same scalar for all)
+    for (u32 i = 0; i < count; i++) {
+        // Convert from 8 u32 limbs to 4 u64 limbs
+        // h_scalar array is in little-endian order: h_scalar[0] is LEAST significant u32
+        // We need to pack sequentially: h_scalars[0] should be least significant u64
+        //
+        // IMPORTANT: gECC's ec_pmul_random_init uses reinterpret_cast<Base*>(u64_array)
+        // which interprets each u64 as two u32s. We pack two sequential u32s into each u64.
+        for (u32 j = 0; j < USED_LIMBS; j++) {
+            // Pack two sequential u32s: low_u32 | (high_u32 << 32)
+            u32 idx = j * 2;
+            h_scalars[i][j] = static_cast<u64>(h_scalar[idx]) |
+                              (static_cast<u64>(h_scalar[idx + 1]) << 32);
+        }
+    }
+
+    // Fill point arrays from column-major format
+    #ifdef GECC_QAPW_OPT_COLUMN_MAJORED_INPUTS
+        for (u32 i = 0; i < count; i++) {
+            // Extract u32 limbs for this point from column-major layout
+            u32 x_limbs[8], y_limbs[8];
+            for (u32 j = 0; j < 8; j++) {
+                x_limbs[j] = managed_points_x[j * count + i];
+                y_limbs[j] = managed_points_y[j * count + i];
+            }
+            // Convert to u64: Pack as low_u32 | (high_u32 << 32) for correct little-endian layout
+            for (u32 j = 0; j < USED_LIMBS; j++) {
+                h_keys_x[i][j] = static_cast<u64>(x_limbs[j * 2]) |
+                                 (static_cast<u64>(x_limbs[j * 2 + 1]) << 32);
+                h_keys_y[i][j] = static_cast<u64>(y_limbs[j * 2]) |
+                                 (static_cast<u64>(y_limbs[j * 2 + 1]) << 32);
+            }
+        }
+    #else
+        for (u32 i = 0; i < count; i++) {
+            // Row-major layout: Pack as low_u32 | (high_u32 << 32) for correct little-endian layout
+            for (u32 j = 0; j < USED_LIMBS; j++) {
+                h_keys_x[i][j] = static_cast<u64>(managed_points_x[i * 8 + j * 2]) |
+                                 (static_cast<u64>(managed_points_x[i * 8 + j * 2 + 1]) << 32);
+                h_keys_y[i][j] = static_cast<u64>(managed_points_y[i * 8 + j * 2]) |
+                                 (static_cast<u64>(managed_points_y[i * 8 + j * 2 + 1]) << 32);
+            }
         }
     #endif
-#endif
 
-    // Launch batch scan kernel
-    BatchScanKernel<<<num_blocks, threads_per_block>>>(
-        *managed_points_x, *managed_points_y, d_scalar,
-        d_outputs, d_output_offsets, d_output_lengths,
-        *managed_match_flags, count
-    );
+    // Call ec_pmul_random_init with our specific data
+    solver->ec_pmul_random_init(h_scalars, h_keys_x, h_keys_y, count);
 
-    cudaDeviceSynchronize();
+    // Free host arrays
+    delete[] h_scalars;
+    delete[] h_keys_x;
+    delete[] h_keys_y;
 
-    // Check for kernel errors
-    err = cudaGetLastError();
+    // Check for initialization errors
+    cudaError_t err = cudaPeekAtLastError();
     if (err != cudaSuccess) {
-        cudaFree(*managed_points_x);
-        cudaFree(*managed_points_y);
-        cudaFree(d_scalar);
-        cudaFree(d_outputs);
-        cudaFree(d_output_offsets);
-        cudaFree(d_output_lengths);
-        cudaFree(*managed_match_flags);
+        printf("ec_pmul_random_init error: %s\n", cudaGetErrorString(err));
         return -1;
     }
 
-    // Free auxiliary memory (keep points and match_flags for caller)
-    cudaFree(d_scalar);
-    cudaFree(d_outputs);
-    cudaFree(d_output_offsets);
-    cudaFree(d_output_lengths);
+    // Run EC multiplication (matching ecdsa_ec_pmul call)
+    // gECC correctness test uses MAX_SM_NUMS blocks (SM count) with 256 threads
+    // This seems to be required for the algorithm to work correctly
+    u32 max_thread_per_block = 256;
+    u32 block_num = MAX_SM_NUMS;  // Use SM count like gECC test
+
+    solver->ecdsa_ec_pmul(block_num, max_thread_per_block, true);  // true = unknown points
+
+    // Check for multiplication errors
+    err = cudaPeekAtLastError();
+    if (err != cudaSuccess) {
+        printf("ecdsa_ec_pmul error: %s\n", cudaGetErrorString(err));
+        return -1;
+    }
+
+    // Extract X coordinates from interleaved R0 format
+    // R0 layout: Point i has X at [i * field_limbs * 2], Y at [i * field_limbs * 2 + field_limbs]
+    // See gECC/ECDSA_CORRECTNESS_TEST.md lines 99-111 for details
+    constexpr u32 field_limbs = 8;  // 8 u32 limbs for 256-bit field
+
+    uint32_t *result_x_coords;
+    err = cudaMallocManaged(&result_x_coords, count * field_limbs * sizeof(uint32_t));
+    if (err != cudaSuccess) {
+        printf("cudaMallocManaged for result_x_coords error: %s\n", cudaGetErrorString(err));
+        return -1;
+    }
+
+    // Extract X coordinates from column-major format (when GECC_QAPW_OPT_COLUMN_MAJORED_INPUTS is defined)
+    // With store_arbitrary: X limb j of point i is at R0[j * count + i]
+    for (u32 i = 0; i < count; i++) {
+        for (u32 j = 0; j < field_limbs; j++) {
+            result_x_coords[i * field_limbs + j] = solver->R0[j * count + i];
+        }
+    }
+
+    cudaDeviceSynchronize();
+
+    // Now check matches
+    int threads_per_block = 256;
+    int num_blocks = (count + threads_per_block - 1) / threads_per_block;
+
+    CheckMatchesKernel<<<num_blocks, threads_per_block>>>(
+        result_x_coords,  // Extracted X coordinates (in Montgomery form)
+        state->d_outputs, state->d_output_offsets, state->d_output_lengths,
+        managed_match_flags, count
+    );
+
+    err = cudaDeviceSynchronize();
+    if (err != cudaSuccess) {
+        printf("CheckMatchesKernel error: %s\n", cudaGetErrorString(err));
+        cudaFree(result_x_coords);
+        return -1;
+    }
+
+    // Free extracted coordinates
+    cudaFree(result_x_coords);
 
     return 0;
+}
+
+// Cleanup function to free batch state
+extern "C" void FreeBatchScanState(void *state_handle) {
+    if (!state_handle) return;
+
+    BatchScanState *state = static_cast<BatchScanState*>(state_handle);
+
+    // Free CUDA buffers
+    if (state->d_outputs) cudaFree(state->d_outputs);
+    if (state->d_output_offsets) cudaFree(state->d_output_offsets);
+    if (state->d_output_lengths) cudaFree(state->d_output_lengths);
+
+    // Delete solver
+    if (state->solver) delete state->solver;
+
+    // Free state struct
+    delete state;
 }

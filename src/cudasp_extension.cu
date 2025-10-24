@@ -10,12 +10,32 @@
 // OpenSSL linked through vcpkg
 #include <openssl/opensslv.h>
 
-// TODO: Add CUDA/gECC includes when GPU support is enabled
-// #ifdef CUDASP_ENABLE_GPU
-// #include <cuda_runtime.h>
-// #include "gecc/arith.h"
-// #include "gecc/hash/sha256.h"
-// #endif
+// CUDA runtime for GPU operations
+#include <cuda_runtime.h>
+
+// Declare CUDA functions from cudasp_gpu.cu
+extern "C" {
+	void* LaunchBatchScan(
+	    uint32_t **managed_points_x,
+	    uint32_t **managed_points_y,
+	    const uint32_t *h_scalar,
+	    const int64_t *h_outputs,
+	    const uint32_t *h_output_offsets,
+	    const uint32_t *h_output_lengths,
+	    uint8_t **managed_match_flags,
+	    uint32_t count,
+	    size_t outputs_size);
+
+	int RunBatchScanKernels(
+	    void *state_handle,
+	    uint32_t *managed_points_x,
+	    uint32_t *managed_points_y,
+	    const uint32_t *h_scalar,
+	    uint8_t *managed_match_flags,
+	    uint32_t count);
+
+	void FreeBatchScanState(void *state_handle);
+}
 
 namespace duckdb {
 
@@ -50,19 +70,6 @@ static void ConvertScalarToU32(const uint8_t* blob_data, uint32_t* out_scalar) {
 	}
 }
 
-// External GPU kernel launcher (defined in cudasp_gpu.cu)
-// Uses cudaMallocManaged and gECC optimizations for better performance
-extern "C" int LaunchBatchScan(
-    uint32_t **managed_points_x,      // Will allocate managed memory
-    uint32_t **managed_points_y,      // Will allocate managed memory
-    const uint32_t *h_scalar,         // Host scalar (8 u32 limbs)
-    const int64_t *h_outputs,         // Host outputs array
-    const uint32_t *h_output_offsets, // Host output offsets
-    const uint32_t *h_output_lengths, // Host output lengths
-    uint8_t **managed_match_flags,    // Will allocate managed memory
-    uint32_t count,
-    size_t outputs_size);
-
 struct CudaspScanBindData : public TableFunctionData {
 	CudaspScanBindData() {
 	}
@@ -70,8 +77,8 @@ struct CudaspScanBindData : public TableFunctionData {
 	static constexpr idx_t TWEAK_KEY_SIZE = 64; // 64 bytes: uncompressed EC point (32-byte x || 32-byte y)
 	static constexpr idx_t SCALAR_SIZE = 32; // 32 bytes: scalar for EC multiplication
 
-	// Scalar parameter for EC multiplication (shared across all rows)
-	string_t scan_private_key;
+	// Scalar parameter for EC multiplication (shared across all rows) - owned copy
+	std::string scan_private_key_data;
 };
 
 struct CudaspScanLocalState : public LocalTableFunctionState {
@@ -221,7 +228,7 @@ static void ProcessBatch(CudaspScanLocalState &local_state, const CudaspScanBind
 
 	// Convert scalar from BLOB to u32 format
 	uint32_t h_scalar[field_limbs];
-	const uint8_t* scalar_data = reinterpret_cast<const uint8_t*>(bind_data.scan_private_key.GetData());
+	const uint8_t* scalar_data = reinterpret_cast<const uint8_t*>(bind_data.scan_private_key_data.data());
 	ConvertScalarToU32(scalar_data, h_scalar);
 
 	// Prepare output offsets and lengths as uint32_t
@@ -232,56 +239,69 @@ static void ProcessBatch(CudaspScanLocalState &local_state, const CudaspScanBind
 		h_output_lengths[i] = static_cast<uint32_t>(local_state.accumulated_output_lengths[i]);
 	}
 
-	// Launch GPU batch scan with managed memory and gECC optimizations
-	// int result = LaunchBatchScan(
-	//     &managed_points_x,  // Function allocates managed memory
-	//     &managed_points_y,  // Function allocates managed memory
-	//     h_scalar,
-	//     local_state.accumulated_outputs.data(),
-	//     h_output_offsets.data(),
-	//     h_output_lengths.data(),
-	//     &managed_match_flags,  // Function allocates managed memory
-	//     static_cast<uint32_t>(batch_size),
-	//     local_state.accumulated_outputs.size()
-	// );
-	//
-	// if (result == 0) {
-	//     // Copy points data to managed memory (host->managed, accessible from GPU)
-	//     memcpy(managed_points_x, h_points_x.data(), batch_size * field_limbs * sizeof(uint32_t));
-	//     memcpy(managed_points_y, h_points_y.data(), batch_size * field_limbs * sizeof(uint32_t));
-	//
-	//     // Build output for matching rows
-	//     for (idx_t i = 0; i < batch_size; i++) {
-	//         if (managed_match_flags[i]) {
-	//             local_state.output_txids.push_back(local_state.accumulated_txids[i]);
-	//             local_state.output_heights.push_back(local_state.accumulated_heights[i]);
-	//             local_state.output_tweak_keys.push_back(local_state.accumulated_tweak_keys[i]);
-	//         }
-	//     }
-	//
-	//     // Cleanup managed memory
-	//     cudaFree(managed_points_x);
-	//     cudaFree(managed_points_y);
-	//     cudaFree(managed_match_flags);
-	// }
+	// Allocate managed memory for GPU processing and create solver state
+	void *state_handle = LaunchBatchScan(
+	    &managed_points_x,  // Function allocates managed memory
+	    &managed_points_y,  // Function allocates managed memory
+	    h_scalar,
+	    local_state.accumulated_outputs.data(),
+	    h_output_offsets.data(),
+	    h_output_lengths.data(),
+	    &managed_match_flags,  // Function allocates managed memory
+	    static_cast<uint32_t>(batch_size),
+	    local_state.accumulated_outputs.size()
+	);
 
-	// TEMPORARY: CPU placeholder until CUDA is properly linked
-	for (idx_t i = 0; i < batch_size; i++) {
-		int64_t computed_value = 12345; // Placeholder
-		bool found = false;
-		idx_t outputs_offset = local_state.accumulated_output_offsets[i];
-		idx_t outputs_length = local_state.accumulated_output_lengths[i];
-		for (idx_t j = 0; j < outputs_length; j++) {
-			if (local_state.accumulated_outputs[outputs_offset + j] == computed_value) {
-				found = true;
-				break;
-			}
-		}
-		if (found) {
-			local_state.output_txids.push_back(local_state.accumulated_txids[i]);
-			local_state.output_heights.push_back(local_state.accumulated_heights[i]);
-			local_state.output_tweak_keys.push_back(local_state.accumulated_tweak_keys[i]);
-		}
+	if (state_handle) {
+	    // Write points data directly to managed memory (exactly like gECC's ec_pmul_random_init)
+#ifdef GECC_QAPW_OPT_COLUMN_MAJORED_INPUTS
+	    // Write in column-major layout directly
+	    for (idx_t j = 0; j < field_limbs; j++) {
+	        for (idx_t i = 0; i < batch_size; i++) {
+	            const uint8_t* tweak_data = reinterpret_cast<const uint8_t*>(local_state.accumulated_tweak_keys[i].GetData());
+	            uint32_t x_limbs[8], y_limbs[8];
+	            ConvertTweakKeyToU32(tweak_data, x_limbs, y_limbs);
+	            managed_points_x[j * batch_size + i] = x_limbs[j];
+	            managed_points_y[j * batch_size + i] = y_limbs[j];
+	        }
+	    }
+#else
+	    memcpy(managed_points_x, h_points_x.data(), batch_size * field_limbs * sizeof(uint32_t));
+	    memcpy(managed_points_y, h_points_y.data(), batch_size * field_limbs * sizeof(uint32_t));
+#endif
+
+	    // Convert scalar to u32 array
+	    uint32_t h_scalar[8];
+	    ConvertScalarToU32(reinterpret_cast<const uint8_t*>(bind_data.scan_private_key_data.data()), h_scalar);
+
+	    // Now run the GPU kernels
+	    int kernel_result = RunBatchScanKernels(
+	        state_handle,
+	        managed_points_x,
+	        managed_points_y,
+	        h_scalar,
+	        managed_match_flags,
+	        static_cast<uint32_t>(batch_size)
+	    );
+
+	    if (kernel_result == 0) {
+	        // Build output for matching rows
+	        for (idx_t i = 0; i < batch_size; i++) {
+	            if (managed_match_flags[i]) {
+	                local_state.output_txids.push_back(local_state.accumulated_txids[i]);
+	                local_state.output_heights.push_back(local_state.accumulated_heights[i]);
+	                local_state.output_tweak_keys.push_back(local_state.accumulated_tweak_keys[i]);
+	            }
+	        }
+	    }
+
+	    // Cleanup managed memory
+	    cudaFree(managed_points_x);
+	    cudaFree(managed_points_y);
+	    cudaFree(managed_match_flags);
+
+	    // Free batch state
+	    FreeBatchScanState(state_handle);
 	}
 
 	// Clear accumulated input after processing
@@ -314,7 +334,7 @@ static unique_ptr<FunctionData> CudaspScanBind(ClientContext &context, TableFunc
 		throw InvalidInputException("Second argument must be a BLOB (32-byte scan_private_key)");
 	}
 
-	// Get the scan_private_key blob using GetValueUnsafe
+	// Get the scan_private_key blob and copy it
 	string_t scan_private_key = StringValue::Get(scalar_value);
 	if (scan_private_key.GetSize() != CudaspScanBindData::SCALAR_SIZE) {
 		throw InvalidInputException("scan_private_key must be exactly 32 bytes, got %llu bytes", scan_private_key.GetSize());
@@ -329,7 +349,8 @@ static unique_ptr<FunctionData> CudaspScanBind(ClientContext &context, TableFunc
 	names.push_back("tweak_key");
 
 	auto bind_data = make_uniq<CudaspScanBindData>();
-	bind_data->scan_private_key = scan_private_key;
+	// Copy the scan_private_key data into owned memory
+	bind_data->scan_private_key_data = std::string(scan_private_key.GetData(), scan_private_key.GetSize());
 	return bind_data;
 }
 
