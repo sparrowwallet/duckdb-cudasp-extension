@@ -6,3 +6,6 @@
 	path = extension-ci-tools
 	url = https://github.com/duckdb/extension-ci-tools
 	branch = main
+[submodule "gECC"]
+	path = gECC
+	url = git@github.com:sparrowwallet/gECC.git

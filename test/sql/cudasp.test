@@ -5,7 +5,7 @@
 # Require statement will ensure this test is run with this extension loaded
 require cudasp
 
-# Test the multiply_compare table function with small dataset
+# Test the cudasp_scan table function with small dataset
 statement ok
 CREATE TABLE test_data(value DOUBLE, search_list DOUBLE[]);
 
@@ -13,7 +13,7 @@ statement ok
 INSERT INTO test_data VALUES (5.0, [10.0, 20.0, 15.0]), (3.0, [5.0, 7.0, 9.0]);
 
 query I
-SELECT multiplied_value FROM multiply_compare((SELECT value, search_list FROM test_data));
+SELECT multiplied_value FROM cudasp_scan((SELECT value, search_list FROM test_data));
 ----
 10.0
 
@@ -24,12 +24,12 @@ SELECT CAST(column0 AS DOUBLE) AS value, CAST(column1 AS DOUBLE[]) AS search_lis
 FROM repeat_row(5.0, [10.0, 20.0, 15.0], num_rows := 20000);
 
 query I
-SELECT COUNT(*) FROM multiply_compare((SELECT value, search_list FROM large_test));
+SELECT COUNT(*) FROM cudasp_scan((SELECT value, search_list FROM large_test));
 ----
 20000
 
 query I
-SELECT DISTINCT multiplied_value FROM multiply_compare((SELECT value, search_list FROM large_test));
+SELECT DISTINCT multiplied_value FROM cudasp_scan((SELECT value, search_list FROM large_test));
 ----
 10.0
 
@@ -40,11 +40,11 @@ SELECT CAST(column0 AS DOUBLE) AS value, CAST(column1 AS DOUBLE[]) AS search_lis
 FROM repeat_row(5.0, [10.0, 20.0, 15.0], num_rows := 200000);
 
 query I
-SELECT COUNT(*) FROM multiply_compare((SELECT value, search_list FROM very_large_test));
+SELECT COUNT(*) FROM cudasp_scan((SELECT value, search_list FROM very_large_test));
 ----
 200000
 
 query I
-SELECT DISTINCT multiplied_value FROM multiply_compare((SELECT value, search_list FROM very_large_test));
+SELECT DISTINCT multiplied_value FROM cudasp_scan((SELECT value, search_list FROM very_large_test));
 ----
 10.0
