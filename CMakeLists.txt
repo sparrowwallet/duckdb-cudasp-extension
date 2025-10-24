@@ -29,6 +29,39 @@ set(CMAKE_CUDA_ARCHITECTURES 80 86 89)
 add_compile_definitions(GECC_QAPW_OPT_COLUMN_MAJORED_INPUTS)
 add_compile_definitions(PERSISTENT_L2_CACHE)
 
+# Generate gECC constants (required for compilation)
+set(GECC_GENERATED_DIR "${CMAKE_CURRENT_BINARY_DIR}/gecc_generated")
+file(MAKE_DIRECTORY ${GECC_GENERATED_DIR})
+
+set(GECC_GENERATED_HEADERS
+    "${GECC_GENERATED_DIR}/fp_constants.h"
+    "${GECC_GENERATED_DIR}/fp_ops_cc_details.h"
+    "${GECC_GENERATED_DIR}/ec_ops_add_details.h"
+    "${GECC_GENERATED_DIR}/ec_ops_dbl_details.h"
+    "${GECC_GENERATED_DIR}/fp_test_constants.h"
+)
+
+add_custom_command(
+    OUTPUT ${GECC_GENERATED_HEADERS}
+    COMMAND ${CMAKE_COMMAND} -E env python3
+        "${CMAKE_CURRENT_SOURCE_DIR}/gECC/scripts/constants_generator.py"
+        --out "${GECC_GENERATED_DIR}"
+    DEPENDS
+        "${CMAKE_CURRENT_SOURCE_DIR}/gECC/scripts/constants_generator.py"
+        "${CMAKE_CURRENT_SOURCE_DIR}/gECC/scripts/constants.py"
+        "${CMAKE_CURRENT_SOURCE_DIR}/gECC/scripts/ccgen.py"
+        "${CMAKE_CURRENT_SOURCE_DIR}/gECC/scripts/ec_ops.py"
+        "${CMAKE_CURRENT_SOURCE_DIR}/gECC/scripts/ec.py"
+        "${CMAKE_CURRENT_SOURCE_DIR}/gECC/scripts/field.py"
+    COMMENT "Generating gECC constants..."
+    VERBATIM
+)
+
+add_custom_target(gecc_constants DEPENDS ${GECC_GENERATED_HEADERS})
+
+# Add generated headers to include path
+include_directories(${GECC_GENERATED_DIR})
+
 set(EXTENSION_SOURCES
     src/cudasp_extension.cpp
     src/cudasp_gpu.cu
@@ -36,6 +69,10 @@ set(EXTENSION_SOURCES
 
 build_static_extension(${TARGET_NAME} ${EXTENSION_SOURCES})
 build_loadable_extension(${TARGET_NAME} " " ${EXTENSION_SOURCES})
+
+# Ensure gECC constants are generated before building
+add_dependencies(${EXTENSION_NAME} gecc_constants)
+add_dependencies(${LOADABLE_EXTENSION_NAME} gecc_constants)
 
 # Link OpenSSL and CUDA in both the static library and the loadable extension
 target_link_libraries(${EXTENSION_NAME} OpenSSL::SSL OpenSSL::Crypto CUDA::cudart)
