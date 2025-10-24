@@ -13,6 +13,26 @@
 // CUDA runtime for GPU operations
 #include <cuda_runtime.h>
 
+// Declare CUDA functions from cudasp_gpu.cu
+extern "C" {
+	int LaunchBatchScan(
+	    uint32_t **managed_points_x,
+	    uint32_t **managed_points_y,
+	    const uint32_t *h_scalar,
+	    const int64_t *h_outputs,
+	    const uint32_t *h_output_offsets,
+	    const uint32_t *h_output_lengths,
+	    uint8_t **managed_match_flags,
+	    uint32_t count,
+	    size_t outputs_size);
+
+	int RunBatchScanKernels(
+	    uint32_t *managed_points_x,
+	    uint32_t *managed_points_y,
+	    uint8_t *managed_match_flags,
+	    uint32_t count);
+}
+
 namespace duckdb {
 
 // Helper function to convert little-endian 64-byte BLOB (x||y) to uint32_t array
@@ -256,12 +276,6 @@ static void ProcessBatch(CudaspScanLocalState &local_state, const CudaspScanBind
 #endif
 
 	    // Now run the GPU kernels
-	    extern "C" int RunBatchScanKernels(
-	        uint32_t *managed_points_x,
-	        uint32_t *managed_points_y,
-	        uint8_t *managed_match_flags,
-	        uint32_t count);
-
 	    int kernel_result = RunBatchScanKernels(
 	        managed_points_x,
 	        managed_points_y,
