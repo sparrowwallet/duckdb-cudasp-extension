@@ -13,7 +13,7 @@ DEFINE_SECP256K1_FP(Fq_SECP256K1, FqSECP256K1, u32, 32, LayoutT<1>, 8, gecc::ari
 DEFINE_EC(G1_EC, G1SECP256K1, Fq_SECP256K1, SECP256K1_CURVE, 1);
 
 using Field = Fq_SECP256K1;
-using ECPoint = G1_EC;
+using ECPoint = G1_EC_G1SECP256K1;  // DEFINE_EC creates TYPE_NAME_CURVE_NAME
 
 // Kernel to convert points to Montgomery form (similar to processScalarPoint in gECC)
 template <typename EC, typename Field>
@@ -213,22 +213,27 @@ extern "C" int LaunchBatchScan(
     cudaDeviceSynchronize();
 
 #ifdef PERSISTENT_L2_CACHE
-    // Optional: Set up persistent L2 cache for better performance
+    // Optional: Set up persistent L2 cache for better performance (CUDA 11.0+)
     // This helps keep frequently accessed data in L2 cache
-    size_t accessPolicyMaxWindowSize;
-    cudaDeviceGetAttribute((int*)&accessPolicyMaxWindowSize, cudaDevAttrAccessPolicyMaxWindowSize, 0);
+    #if CUDART_VERSION >= 11000
+        size_t accessPolicyMaxWindowSize = 0;
+        cudaError_t attr_err = cudaDeviceGetAttribute((int*)&accessPolicyMaxWindowSize,
+                                                       cudaDevAttrAccessPolicyMaxWindowSize, 0);
 
-    size_t needed_bytes_pers_l2_cache = count * Field::SIZE;
-    size_t setted_pers_l2_cache = std::max(needed_bytes_pers_l2_cache,
-                                             std::min(needed_bytes_pers_l2_cache, accessPolicyMaxWindowSize));
+        if (attr_err == cudaSuccess && accessPolicyMaxWindowSize > 0) {
+            size_t needed_bytes_pers_l2_cache = count * Field::SIZE;
+            size_t setted_pers_l2_cache = std::max(needed_bytes_pers_l2_cache,
+                                                     std::min(needed_bytes_pers_l2_cache, accessPolicyMaxWindowSize));
 
-    cudaStreamAttrValue stream_attribute;
-    stream_attribute.accessPolicyWindow.base_ptr = reinterpret_cast<void*>(*managed_points_x);
-    stream_attribute.accessPolicyWindow.num_bytes = setted_pers_l2_cache;
-    stream_attribute.accessPolicyWindow.hitRatio = 1.0;
-    stream_attribute.accessPolicyWindow.hitProp = cudaAccessPropertyPersisting;
-    stream_attribute.accessPolicyWindow.missProp = cudaAccessPropertyStreaming;
-    cudaStreamSetAttribute(0, cudaStreamAttributeAccessPolicyWindow, &stream_attribute);
+            cudaStreamAttrValue stream_attribute;
+            stream_attribute.accessPolicyWindow.base_ptr = reinterpret_cast<void*>(*managed_points_x);
+            stream_attribute.accessPolicyWindow.num_bytes = setted_pers_l2_cache;
+            stream_attribute.accessPolicyWindow.hitRatio = 1.0;
+            stream_attribute.accessPolicyWindow.hitProp = cudaAccessPropertyPersisting;
+            stream_attribute.accessPolicyWindow.missProp = cudaAccessPropertyStreaming;
+            cudaStreamSetAttribute(0, cudaStreamAttributeAccessPolicyWindow, &stream_attribute);
+        }
+    #endif
 #endif
 
     // Launch batch scan kernel
