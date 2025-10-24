@@ -74,7 +74,10 @@ __global__ void BatchScanKernel(
     }
 
     // Convert to Jacobian coordinates (Z=1 in Montgomery form)
-    ECPoint base_jac(px, py, Field::mont_one());
+    ECPoint base_jac;
+    base_jac.x = px;
+    base_jac.y = py;
+    base_jac.z = Field::mont_one();
 
     // Perform scalar multiplication using double-and-add
     ECPoint result_jac = ECPoint::zero();
@@ -216,11 +219,13 @@ extern "C" int LaunchBatchScan(
     // Optional: Set up persistent L2 cache for better performance (CUDA 11.0+)
     // This helps keep frequently accessed data in L2 cache
     #if CUDART_VERSION >= 11000
-        size_t accessPolicyMaxWindowSize = 0;
-        cudaError_t attr_err = cudaDeviceGetAttribute((int*)&accessPolicyMaxWindowSize,
-                                                       cudaDevAttrAccessPolicyMaxWindowSize, 0);
+        cudaDeviceProp device_prop;
+        int current_device = 0;
+        cudaGetDevice(&current_device);
+        cudaGetDeviceProperties(&device_prop, current_device);
+        size_t accessPolicyMaxWindowSize = device_prop.accessPolicyMaxWindowSize;
 
-        if (attr_err == cudaSuccess && accessPolicyMaxWindowSize > 0) {
+        if (accessPolicyMaxWindowSize > 0) {
             size_t needed_bytes_pers_l2_cache = count * Field::SIZE;
             size_t setted_pers_l2_cache = std::max(needed_bytes_pers_l2_cache,
                                                      std::min(needed_bytes_pers_l2_cache, accessPolicyMaxWindowSize));
