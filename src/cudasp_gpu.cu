@@ -64,6 +64,12 @@ __global__ void BatchScanKernel(
     px.load_arbitrary(input_points_x, count, slot_idx, lane_idx);
     py.load_arbitrary(input_points_y, count, slot_idx, lane_idx);
 
+    // Debug: print input coordinates for first thread
+    if (slot_idx == 0 && lane_idx == 0) {
+        printf("Input point (before Montgomery): px.digits[0]=%u, py.digits[0]=%u\n",
+               px.digits[0], py.digits[0]);
+    }
+
     // Load scalar (shared across all threads, but each thread loads it)
     Field scalar_field;
     // For shared scalar, we broadcast it to all threads
@@ -122,6 +128,15 @@ __global__ void BatchScanKernel(
 
     // Write match flag
     match_flags[slot_idx] = found ? 1 : 0;
+
+    // Debug: print first few results
+    if (slot_idx < 3) {
+        printf("Thread %u: computed_int64=%lld, outputs=[", slot_idx, (long long)computed_value);
+        for (uint32_t j = 0; j < min(length, 5u); ++j) {
+            printf("%lld%s", (long long)outputs[offset + j], (j < length - 1) ? ", " : "");
+        }
+        printf("], found=%d\n", found);
+    }
 }
 
 // Host function to setup managed memory and launch kernels

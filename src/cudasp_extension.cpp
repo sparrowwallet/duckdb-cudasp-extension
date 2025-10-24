@@ -233,55 +233,36 @@ static void ProcessBatch(CudaspScanLocalState &local_state, const CudaspScanBind
 	}
 
 	// Launch GPU batch scan with managed memory and gECC optimizations
-	// int result = LaunchBatchScan(
-	//     &managed_points_x,  // Function allocates managed memory
-	//     &managed_points_y,  // Function allocates managed memory
-	//     h_scalar,
-	//     local_state.accumulated_outputs.data(),
-	//     h_output_offsets.data(),
-	//     h_output_lengths.data(),
-	//     &managed_match_flags,  // Function allocates managed memory
-	//     static_cast<uint32_t>(batch_size),
-	//     local_state.accumulated_outputs.size()
-	// );
-	//
-	// if (result == 0) {
-	//     // Copy points data to managed memory (host->managed, accessible from GPU)
-	//     memcpy(managed_points_x, h_points_x.data(), batch_size * field_limbs * sizeof(uint32_t));
-	//     memcpy(managed_points_y, h_points_y.data(), batch_size * field_limbs * sizeof(uint32_t));
-	//
-	//     // Build output for matching rows
-	//     for (idx_t i = 0; i < batch_size; i++) {
-	//         if (managed_match_flags[i]) {
-	//             local_state.output_txids.push_back(local_state.accumulated_txids[i]);
-	//             local_state.output_heights.push_back(local_state.accumulated_heights[i]);
-	//             local_state.output_tweak_keys.push_back(local_state.accumulated_tweak_keys[i]);
-	//         }
-	//     }
-	//
-	//     // Cleanup managed memory
-	//     cudaFree(managed_points_x);
-	//     cudaFree(managed_points_y);
-	//     cudaFree(managed_match_flags);
-	// }
+	int result = LaunchBatchScan(
+	    &managed_points_x,  // Function allocates managed memory
+	    &managed_points_y,  // Function allocates managed memory
+	    h_scalar,
+	    local_state.accumulated_outputs.data(),
+	    h_output_offsets.data(),
+	    h_output_lengths.data(),
+	    &managed_match_flags,  // Function allocates managed memory
+	    static_cast<uint32_t>(batch_size),
+	    local_state.accumulated_outputs.size()
+	);
 
-	// TEMPORARY: CPU placeholder until CUDA is properly linked
-	for (idx_t i = 0; i < batch_size; i++) {
-		int64_t computed_value = 12345; // Placeholder
-		bool found = false;
-		idx_t outputs_offset = local_state.accumulated_output_offsets[i];
-		idx_t outputs_length = local_state.accumulated_output_lengths[i];
-		for (idx_t j = 0; j < outputs_length; j++) {
-			if (local_state.accumulated_outputs[outputs_offset + j] == computed_value) {
-				found = true;
-				break;
-			}
-		}
-		if (found) {
-			local_state.output_txids.push_back(local_state.accumulated_txids[i]);
-			local_state.output_heights.push_back(local_state.accumulated_heights[i]);
-			local_state.output_tweak_keys.push_back(local_state.accumulated_tweak_keys[i]);
-		}
+	if (result == 0) {
+	    // Copy points data to managed memory (host->managed, accessible from GPU)
+	    memcpy(managed_points_x, h_points_x.data(), batch_size * field_limbs * sizeof(uint32_t));
+	    memcpy(managed_points_y, h_points_y.data(), batch_size * field_limbs * sizeof(uint32_t));
+
+	    // Build output for matching rows
+	    for (idx_t i = 0; i < batch_size; i++) {
+	        if (managed_match_flags[i]) {
+	            local_state.output_txids.push_back(local_state.accumulated_txids[i]);
+	            local_state.output_heights.push_back(local_state.accumulated_heights[i]);
+	            local_state.output_tweak_keys.push_back(local_state.accumulated_tweak_keys[i]);
+	        }
+	    }
+
+	    // Cleanup managed memory
+	    cudaFree(managed_points_x);
+	    cudaFree(managed_points_y);
+	    cudaFree(managed_match_flags);
 	}
 
 	// Clear accumulated input after processing
