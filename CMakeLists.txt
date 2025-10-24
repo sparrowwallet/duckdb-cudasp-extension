@@ -1,27 +1,50 @@
-cmake_minimum_required(VERSION 3.5)
+cmake_minimum_required(VERSION 3.18)
 
 # Set extension name here
 set(TARGET_NAME cudasp)
+
+# Enable CUDA support
+enable_language(CUDA)
+set(CMAKE_CUDA_STANDARD 17)
+set(CMAKE_CUDA_STANDARD_REQUIRED ON)
 
 # DuckDB's extension distribution supports vcpkg. As such, dependencies can be added in ./vcpkg.json and then
 # used in cmake with find_package. Feel free to remove or replace with other dependencies.
 # Note that it should also be removed from vcpkg.json to prevent needlessly installing it..
 find_package(OpenSSL REQUIRED)
+find_package(CUDAToolkit REQUIRED)
 
 set(EXTENSION_NAME ${TARGET_NAME}_extension)
 set(LOADABLE_EXTENSION_NAME ${TARGET_NAME}_loadable_extension)
 
-project(${TARGET_NAME})
+project(${TARGET_NAME} LANGUAGES CXX CUDA)
 include_directories(src/include)
+include_directories(gECC/include)
 
-set(EXTENSION_SOURCES src/cudasp_extension.cpp)
+# Set CUDA architecture (adjust based on your GPU)
+# Common values: 75 (Turing), 80 (Ampere), 86 (RTX 30xx), 89 (RTX 40xx)
+set(CMAKE_CUDA_ARCHITECTURES 80 86 89)
+
+# Enable gECC optimizations
+add_compile_definitions(GECC_QAPW_OPT_COLUMN_MAJORED_INPUTS)
+add_compile_definitions(PERSISTENT_L2_CACHE)
+
+set(EXTENSION_SOURCES
+    src/cudasp_extension.cpp
+    src/cudasp_gpu.cu
+)
 
 build_static_extension(${TARGET_NAME} ${EXTENSION_SOURCES})
 build_loadable_extension(${TARGET_NAME} " " ${EXTENSION_SOURCES})
 
-# Link OpenSSL in both the static library as the loadable extension
-target_link_libraries(${EXTENSION_NAME} OpenSSL::SSL OpenSSL::Crypto)
-target_link_libraries(${LOADABLE_EXTENSION_NAME} OpenSSL::SSL OpenSSL::Crypto)
+# Link OpenSSL and CUDA in both the static library and the loadable extension
+target_link_libraries(${EXTENSION_NAME} OpenSSL::SSL OpenSSL::Crypto CUDA::cudart)
+target_link_libraries(${LOADABLE_EXTENSION_NAME} OpenSSL::SSL OpenSSL::Crypto CUDA::cudart)
+
+# Set CUDA-specific compile options
+set_source_files_properties(src/cudasp_gpu.cu PROPERTIES LANGUAGE CUDA)
+target_compile_options(${EXTENSION_NAME} PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:--expt-relaxed-constexpr>)
+target_compile_options(${LOADABLE_EXTENSION_NAME} PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:--expt-relaxed-constexpr>)
 
 install(
   TARGETS ${EXTENSION_NAME}

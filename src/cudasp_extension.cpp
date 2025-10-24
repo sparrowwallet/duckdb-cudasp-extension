@@ -10,7 +10,58 @@
 // OpenSSL linked through vcpkg
 #include <openssl/opensslv.h>
 
+// TODO: Add CUDA/gECC includes when GPU support is enabled
+// #ifdef CUDASP_ENABLE_GPU
+// #include <cuda_runtime.h>
+// #include "gecc/arith.h"
+// #include "gecc/hash/sha256.h"
+// #endif
+
 namespace duckdb {
+
+// Helper function to convert little-endian 64-byte BLOB (x||y) to uint32_t array
+// Input: 64 bytes = 32-byte x (little-endian) || 32-byte y (little-endian)
+// Output: 16 uint32_t values (8 for x, 8 for y) in little-endian order
+static void ConvertTweakKeyToU32(const uint8_t* blob_data, uint32_t* out_x, uint32_t* out_y) {
+	// Convert 32-byte x coordinate (little-endian) to 8 u32 limbs
+	for (int i = 0; i < 8; i++) {
+		out_x[i] = static_cast<uint32_t>(blob_data[i * 4]) |
+		           (static_cast<uint32_t>(blob_data[i * 4 + 1]) << 8) |
+		           (static_cast<uint32_t>(blob_data[i * 4 + 2]) << 16) |
+		           (static_cast<uint32_t>(blob_data[i * 4 + 3]) << 24);
+	}
+
+	// Convert 32-byte y coordinate (little-endian) to 8 u32 limbs
+	for (int i = 0; i < 8; i++) {
+		out_y[i] = static_cast<uint32_t>(blob_data[32 + i * 4]) |
+		           (static_cast<uint32_t>(blob_data[32 + i * 4 + 1]) << 8) |
+		           (static_cast<uint32_t>(blob_data[32 + i * 4 + 2]) << 16) |
+		           (static_cast<uint32_t>(blob_data[32 + i * 4 + 3]) << 24);
+	}
+}
+
+// Helper function to convert 32-byte scalar BLOB to uint32_t array
+static void ConvertScalarToU32(const uint8_t* blob_data, uint32_t* out_scalar) {
+	for (int i = 0; i < 8; i++) {
+		out_scalar[i] = static_cast<uint32_t>(blob_data[i * 4]) |
+		                (static_cast<uint32_t>(blob_data[i * 4 + 1]) << 8) |
+		                (static_cast<uint32_t>(blob_data[i * 4 + 2]) << 16) |
+		                (static_cast<uint32_t>(blob_data[i * 4 + 3]) << 24);
+	}
+}
+
+// External GPU kernel launcher (defined in cudasp_gpu.cu)
+// Uses cudaMallocManaged and gECC optimizations for better performance
+extern "C" int LaunchBatchScan(
+    uint32_t **managed_points_x,      // Will allocate managed memory
+    uint32_t **managed_points_y,      // Will allocate managed memory
+    const uint32_t *h_scalar,         // Host scalar (8 u32 limbs)
+    const int64_t *h_outputs,         // Host outputs array
+    const uint32_t *h_output_offsets, // Host output offsets
+    const uint32_t *h_output_lengths, // Host output lengths
+    uint8_t **managed_match_flags,    // Will allocate managed memory
+    uint32_t count,
+    size_t outputs_size);
 
 struct CudaspScanBindData : public TableFunctionData {
 	CudaspScanBindData() {
@@ -120,17 +171,6 @@ static void AccumulateInput(CudaspScanLocalState &local_state, DataChunk &input)
 }
 
 static void ProcessBatch(CudaspScanLocalState &local_state, const CudaspScanBindData &bind_data) {
-	// TODO: GPU processing with gECC will happen here
-	// Steps:
-	// 1. Copy tweak_keys to GPU memory (column-major format for gECC)
-	// 2. Copy scalar to GPU memory (shared across all rows)
-	// 3. Perform batch EC point multiplication: result_point[i] = scalar * tweak_key[i]
-	// 4. Extract int64 from each result_point
-	// 5. Copy outputs to GPU memory
-	// 6. Compare extracted int64 against outputs[i] list on GPU
-	// 7. Copy matching row indices back to CPU
-	// 8. Build output vectors for matching rows
-
 	// Clear any previous output
 	local_state.output_txids.clear();
 	local_state.output_heights.clear();
@@ -138,14 +178,96 @@ static void ProcessBatch(CudaspScanLocalState &local_state, const CudaspScanBind
 	local_state.output_position = 0;
 
 	idx_t batch_size = local_state.accumulated_txids.size();
+	if (batch_size == 0) {
+		return;
+	}
 
-	// CPU placeholder implementation (will be replaced with GPU code)
+	// Prepare host data for GPU
+	const idx_t field_limbs = 8; // 8 u32 limbs for 256-bit field
+
+	// Allocate managed memory for point coordinates (will be accessible from GPU)
+	uint32_t *managed_points_x = nullptr;
+	uint32_t *managed_points_y = nullptr;
+	uint8_t *managed_match_flags = nullptr;
+
+	// For now, allocate temporary host arrays for conversion
+	std::vector<uint32_t> h_points_x(batch_size * field_limbs);
+	std::vector<uint32_t> h_points_y(batch_size * field_limbs);
+
+	// Convert tweak_keys from BLOB to u32 format (row-major first)
 	for (idx_t i = 0; i < batch_size; i++) {
-		// TODO: Replace with GPU EC multiplication and int64 extraction
-		// For now, use a dummy value
-		int64_t computed_value = 12345; // Placeholder for: extract_int64(scalar * tweak_key[i])
+		const uint8_t* tweak_data = reinterpret_cast<const uint8_t*>(local_state.accumulated_tweak_keys[i].GetData());
+		ConvertTweakKeyToU32(tweak_data,
+		                     &h_points_x[i * field_limbs],
+		                     &h_points_y[i * field_limbs]);
+	}
 
-		// Check if computed value is in the outputs list
+#ifdef GECC_QAPW_OPT_COLUMN_MAJORED_INPUTS
+	// Convert to column-major layout for gECC optimization
+	std::vector<uint32_t> h_points_x_col(batch_size * field_limbs);
+	std::vector<uint32_t> h_points_y_col(batch_size * field_limbs);
+
+	for (idx_t j = 0; j < field_limbs; j++) {
+		for (idx_t i = 0; i < batch_size; i++) {
+			h_points_x_col[j * batch_size + i] = h_points_x[i * field_limbs + j];
+			h_points_y_col[j * batch_size + i] = h_points_y[i * field_limbs + j];
+		}
+	}
+
+	// Use column-major data
+	h_points_x = std::move(h_points_x_col);
+	h_points_y = std::move(h_points_y_col);
+#endif
+
+	// Convert scalar from BLOB to u32 format
+	uint32_t h_scalar[field_limbs];
+	const uint8_t* scalar_data = reinterpret_cast<const uint8_t*>(bind_data.scan_private_key.GetData());
+	ConvertScalarToU32(scalar_data, h_scalar);
+
+	// Prepare output offsets and lengths as uint32_t
+	std::vector<uint32_t> h_output_offsets(batch_size);
+	std::vector<uint32_t> h_output_lengths(batch_size);
+	for (idx_t i = 0; i < batch_size; i++) {
+		h_output_offsets[i] = static_cast<uint32_t>(local_state.accumulated_output_offsets[i]);
+		h_output_lengths[i] = static_cast<uint32_t>(local_state.accumulated_output_lengths[i]);
+	}
+
+	// Launch GPU batch scan with managed memory and gECC optimizations
+	// int result = LaunchBatchScan(
+	//     &managed_points_x,  // Function allocates managed memory
+	//     &managed_points_y,  // Function allocates managed memory
+	//     h_scalar,
+	//     local_state.accumulated_outputs.data(),
+	//     h_output_offsets.data(),
+	//     h_output_lengths.data(),
+	//     &managed_match_flags,  // Function allocates managed memory
+	//     static_cast<uint32_t>(batch_size),
+	//     local_state.accumulated_outputs.size()
+	// );
+	//
+	// if (result == 0) {
+	//     // Copy points data to managed memory (host->managed, accessible from GPU)
+	//     memcpy(managed_points_x, h_points_x.data(), batch_size * field_limbs * sizeof(uint32_t));
+	//     memcpy(managed_points_y, h_points_y.data(), batch_size * field_limbs * sizeof(uint32_t));
+	//
+	//     // Build output for matching rows
+	//     for (idx_t i = 0; i < batch_size; i++) {
+	//         if (managed_match_flags[i]) {
+	//             local_state.output_txids.push_back(local_state.accumulated_txids[i]);
+	//             local_state.output_heights.push_back(local_state.accumulated_heights[i]);
+	//             local_state.output_tweak_keys.push_back(local_state.accumulated_tweak_keys[i]);
+	//         }
+	//     }
+	//
+	//     // Cleanup managed memory
+	//     cudaFree(managed_points_x);
+	//     cudaFree(managed_points_y);
+	//     cudaFree(managed_match_flags);
+	// }
+
+	// TEMPORARY: CPU placeholder until CUDA is properly linked
+	for (idx_t i = 0; i < batch_size; i++) {
+		int64_t computed_value = 12345; // Placeholder
 		bool found = false;
 		idx_t outputs_offset = local_state.accumulated_output_offsets[i];
 		idx_t outputs_length = local_state.accumulated_output_lengths[i];
@@ -155,8 +277,6 @@ static void ProcessBatch(CudaspScanLocalState &local_state, const CudaspScanBind
 				break;
 			}
 		}
-
-		// Only output rows where a match was found
 		if (found) {
 			local_state.output_txids.push_back(local_state.accumulated_txids[i]);
 			local_state.output_heights.push_back(local_state.accumulated_heights[i]);
