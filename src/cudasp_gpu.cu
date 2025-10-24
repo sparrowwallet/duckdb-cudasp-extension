@@ -274,8 +274,16 @@ extern "C" int RunBatchScanKernels(
     // Process points: convert to Montgomery form on GPU (like gECC's processScalarPoint)
     int threads_per_block = 256;
     int num_blocks = (count + threads_per_block - 1) / threads_per_block;
+
+    printf("Launching ProcessPointsKernel with %d blocks, %d threads, count=%u\n", num_blocks, threads_per_block, count);
     ProcessPointsKernel<ECPoint, Field><<<num_blocks, threads_per_block>>>(managed_points_x, managed_points_y, count);
-    cudaDeviceSynchronize();
+
+    cudaError_t err = cudaDeviceSynchronize();
+    if (err != cudaSuccess) {
+        printf("ProcessPointsKernel error: %s\n", cudaGetErrorString(err));
+        return -1;
+    }
+    printf("ProcessPointsKernel completed successfully\n");
 
 #ifdef PERSISTENT_L2_CACHE
     // Optional: Set up persistent L2 cache for better performance (CUDA 11.0+)
@@ -303,17 +311,24 @@ extern "C" int RunBatchScanKernels(
 #endif
 
     // Launch batch scan kernel
+    printf("Launching BatchScanKernel with %d blocks, %d threads\n", num_blocks, threads_per_block);
     BatchScanKernel<<<num_blocks, threads_per_block>>>(
         managed_points_x, managed_points_y, g_d_scalar,
         g_d_outputs, g_d_output_offsets, g_d_output_lengths,
         managed_match_flags, count
     );
 
-    cudaDeviceSynchronize();
+    err = cudaDeviceSynchronize();
+    if (err != cudaSuccess) {
+        printf("BatchScanKernel error: %s\n", cudaGetErrorString(err));
+        return -1;
+    }
+    printf("BatchScanKernel completed successfully\n");
 
     // Check for kernel errors
-    cudaError_t err = cudaGetLastError();
+    err = cudaGetLastError();
     if (err != cudaSuccess) {
+        printf("cudaGetLastError: %s\n", cudaGetErrorString(err));
         return -1;
     }
 
