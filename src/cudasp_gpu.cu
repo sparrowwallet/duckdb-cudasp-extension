@@ -79,6 +79,11 @@ __global__ void BatchScanKernel(
         scalar_field.digits[i] = scalar[i];
     }
 
+    // Debug: print scalar for first thread
+    if (slot_idx == 0 && lane_idx == 0) {
+        printf("Scalar: digits[0]=%u, digits[1]=%u\n", scalar_field.digits[0], scalar_field.digits[1]);
+    }
+
     // Convert to Jacobian coordinates (Z=1 in Montgomery form)
     ECPoint base_jac;
     base_jac.x = px;
@@ -109,6 +114,12 @@ __global__ void BatchScanKernel(
     // Extract int64 from result point (lower 64 bits of x-coordinate)
     // The x-coordinate is in Montgomery form, so convert to normal form first
     Field result_x_normal = result_x.from_montgomery();
+
+    // Debug: print result for first thread
+    if (slot_idx == 0 && lane_idx == 0) {
+        printf("Result x (normal form): digits[0]=%u, digits[1]=%u\n",
+               result_x_normal.digits[0], result_x_normal.digits[1]);
+    }
 
     // Extract lower 64 bits (first 2 u32 limbs in little-endian)
     int64_t computed_value = static_cast<int64_t>(result_x_normal.digits[0]) |
