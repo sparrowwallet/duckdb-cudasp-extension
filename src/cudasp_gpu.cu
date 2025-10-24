@@ -214,25 +214,60 @@ extern "C" int LaunchBatchScan(
         return -1;
     }
 
-    // Copy scalar and auxiliary data (host->managed can be done directly)
+    // Store auxiliary data pointers for RunBatchScanKernels to use
+    // We need to keep these allocated until after kernels run
+    // For now, just copy the data and let caller call RunBatchScanKernels
     memcpy(d_scalar, h_scalar, Field::SIZE);
     memcpy(d_outputs, h_outputs, outputs_size * sizeof(int64_t));
     memcpy(d_output_offsets, h_output_offsets, count * sizeof(uint32_t));
     memcpy(d_output_lengths, h_output_lengths, count * sizeof(uint32_t));
 
-    // Points data should already be copied by caller to *managed_points_x and *managed_points_y
+    // Store these pointers in global state so RunBatchScanKernels can use them
+    // For simplicity, using static variables (not thread-safe, but OK for now)
+    static uint32_t *g_d_scalar = nullptr;
+    static int64_t *g_d_outputs = nullptr;
+    static uint32_t *g_d_output_offsets = nullptr;
+    static uint32_t *g_d_output_lengths = nullptr;
+    static uint32_t g_count = 0;
+
+    // Free previous allocations if any
+    if (g_d_scalar) cudaFree(g_d_scalar);
+    if (g_d_outputs) cudaFree(g_d_outputs);
+    if (g_d_output_offsets) cudaFree(g_d_output_offsets);
+    if (g_d_output_lengths) cudaFree(g_d_output_lengths);
+
+    g_d_scalar = d_scalar;
+    g_d_outputs = d_outputs;
+    g_d_output_offsets = d_output_offsets;
+    g_d_output_lengths = d_output_lengths;
+    g_count = count;
+
+    return 0;
+}
+
+// Run the GPU kernels after caller has filled managed memory
+extern "C" int RunBatchScanKernels(
+    uint32_t *managed_points_x,
+    uint32_t *managed_points_y,
+    uint8_t *managed_match_flags,
+    uint32_t count) {
+
+    // Retrieve the auxiliary data pointers
+    static uint32_t *g_d_scalar = nullptr;
+    static int64_t *g_d_outputs = nullptr;
+    static uint32_t *g_d_output_offsets = nullptr;
+    static uint32_t *g_d_output_lengths = nullptr;
 
     cudaDeviceSynchronize();
 
-    // Process points: convert to Montgomery form on GPU
+    // Process points: convert to Montgomery form on GPU (like gECC's processScalarPoint)
     int threads_per_block = 256;
     int num_blocks = (count + threads_per_block - 1) / threads_per_block;
-    ProcessPointsKernel<ECPoint, Field><<<num_blocks, threads_per_block>>>(*managed_points_x, *managed_points_y, count);
+    ProcessPointsKernel<ECPoint, Field><<<num_blocks, threads_per_block>>>(managed_points_x, managed_points_y, count);
     cudaDeviceSynchronize();
 
 #ifdef PERSISTENT_L2_CACHE
     // Optional: Set up persistent L2 cache for better performance (CUDA 11.0+)
-    // This helps keep frequently accessed data in L2 cache
     #if CUDART_VERSION >= 11000
         cudaDeviceProp device_prop;
         int current_device = 0;
@@ -246,7 +281,7 @@ extern "C" int LaunchBatchScan(
                                                      std::min(needed_bytes_pers_l2_cache, accessPolicyMaxWindowSize));
 
             cudaStreamAttrValue stream_attribute;
-            stream_attribute.accessPolicyWindow.base_ptr = reinterpret_cast<void*>(*managed_points_x);
+            stream_attribute.accessPolicyWindow.base_ptr = reinterpret_cast<void*>(managed_points_x);
             stream_attribute.accessPolicyWindow.num_bytes = setted_pers_l2_cache;
             stream_attribute.accessPolicyWindow.hitRatio = 1.0;
             stream_attribute.accessPolicyWindow.hitProp = cudaAccessPropertyPersisting;
@@ -258,31 +293,29 @@ extern "C" int LaunchBatchScan(
 
     // Launch batch scan kernel
     BatchScanKernel<<<num_blocks, threads_per_block>>>(
-        *managed_points_x, *managed_points_y, d_scalar,
-        d_outputs, d_output_offsets, d_output_lengths,
-        *managed_match_flags, count
+        managed_points_x, managed_points_y, g_d_scalar,
+        g_d_outputs, g_d_output_offsets, g_d_output_lengths,
+        managed_match_flags, count
     );
 
     cudaDeviceSynchronize();
 
     // Check for kernel errors
-    err = cudaGetLastError();
+    cudaError_t err = cudaGetLastError();
     if (err != cudaSuccess) {
-        cudaFree(*managed_points_x);
-        cudaFree(*managed_points_y);
-        cudaFree(d_scalar);
-        cudaFree(d_outputs);
-        cudaFree(d_output_offsets);
-        cudaFree(d_output_lengths);
-        cudaFree(*managed_match_flags);
         return -1;
     }
 
-    // Free auxiliary memory (keep points and match_flags for caller)
-    cudaFree(d_scalar);
-    cudaFree(d_outputs);
-    cudaFree(d_output_offsets);
-    cudaFree(d_output_lengths);
+    // Free auxiliary memory
+    cudaFree(g_d_scalar);
+    cudaFree(g_d_outputs);
+    cudaFree(g_d_output_offsets);
+    cudaFree(g_d_output_lengths);
+
+    g_d_scalar = nullptr;
+    g_d_outputs = nullptr;
+    g_d_output_offsets = nullptr;
+    g_d_output_lengths = nullptr;
 
     return 0;
 }

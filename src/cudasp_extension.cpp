@@ -10,12 +10,8 @@
 // OpenSSL linked through vcpkg
 #include <openssl/opensslv.h>
 
-// TODO: Add CUDA/gECC includes when GPU support is enabled
-// #ifdef CUDASP_ENABLE_GPU
-// #include <cuda_runtime.h>
-// #include "gecc/arith.h"
-// #include "gecc/hash/sha256.h"
-// #endif
+// CUDA runtime for GPU operations
+#include <cuda_runtime.h>
 
 namespace duckdb {
 
@@ -232,7 +228,7 @@ static void ProcessBatch(CudaspScanLocalState &local_state, const CudaspScanBind
 		h_output_lengths[i] = static_cast<uint32_t>(local_state.accumulated_output_lengths[i]);
 	}
 
-	// Launch GPU batch scan with managed memory and gECC optimizations
+	// Allocate managed memory for GPU processing
 	int result = LaunchBatchScan(
 	    &managed_points_x,  // Function allocates managed memory
 	    &managed_points_y,  // Function allocates managed memory
@@ -246,16 +242,41 @@ static void ProcessBatch(CudaspScanLocalState &local_state, const CudaspScanBind
 	);
 
 	if (result == 0) {
-	    // Copy points data to managed memory (host->managed, accessible from GPU)
+	    // Write points data directly to managed memory (like gECC's ec_pmul_random_init)
+	    // With managed memory, CPU can write directly - no need for separate host array
+#ifdef GECC_QAPW_OPT_COLUMN_MAJORED_INPUTS
+	    // Data is already in column-major format in h_points_x/y
+	    for (idx_t i = 0; i < batch_size * field_limbs; i++) {
+	        managed_points_x[i] = h_points_x[i];
+	        managed_points_y[i] = h_points_y[i];
+	    }
+#else
 	    memcpy(managed_points_x, h_points_x.data(), batch_size * field_limbs * sizeof(uint32_t));
 	    memcpy(managed_points_y, h_points_y.data(), batch_size * field_limbs * sizeof(uint32_t));
+#endif
 
-	    // Build output for matching rows
-	    for (idx_t i = 0; i < batch_size; i++) {
-	        if (managed_match_flags[i]) {
-	            local_state.output_txids.push_back(local_state.accumulated_txids[i]);
-	            local_state.output_heights.push_back(local_state.accumulated_heights[i]);
-	            local_state.output_tweak_keys.push_back(local_state.accumulated_tweak_keys[i]);
+	    // Now run the GPU kernels
+	    extern "C" int RunBatchScanKernels(
+	        uint32_t *managed_points_x,
+	        uint32_t *managed_points_y,
+	        uint8_t *managed_match_flags,
+	        uint32_t count);
+
+	    int kernel_result = RunBatchScanKernels(
+	        managed_points_x,
+	        managed_points_y,
+	        managed_match_flags,
+	        static_cast<uint32_t>(batch_size)
+	    );
+
+	    if (kernel_result == 0) {
+	        // Build output for matching rows
+	        for (idx_t i = 0; i < batch_size; i++) {
+	            if (managed_match_flags[i]) {
+	                local_state.output_txids.push_back(local_state.accumulated_txids[i]);
+	                local_state.output_heights.push_back(local_state.accumulated_heights[i]);
+	                local_state.output_tweak_keys.push_back(local_state.accumulated_tweak_keys[i]);
+	            }
 	        }
 	    }
 
