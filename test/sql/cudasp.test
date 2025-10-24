@@ -16,18 +16,18 @@ CREATE TABLE test_data(
 
 statement ok
 INSERT INTO test_data VALUES
-    (BLOB '\x00\x01\x02\x03', 100, BLOB '\x9817f8165b81f259d928ce2ddbfc9b02070b87ce9562a055acbbdcf97e66be79b8d410fb8fd0479c195485a648b417fda808110efcfba45d65c4a32677da3a48', [7323199135511107817, 67890]),
-    (BLOB '\x10\x11\x12\x13', 101, BLOB '\xe59e705cb909acaba73cef8c4b8e775cd87cc0956e4045306d7ded41947f04c62ae5cf50a9316423e1d066326532f6f7eeea6c461984c5a339c33da6fe68e11a', [11111, 22222]);
+    (BLOB '\x00\x01\x02\x03', 100, BLOB '\x98\x17\xf8\x16\x5b\x81\xf2\x59\xd9\x28\xce\x2d\xdb\xfc\x9b\x02\x07\x0b\x87\xce\x95\x62\xa0\x55\xac\xbb\xdc\xf9\x7e\x66\xbe\x79\xb8\xd4\x10\xfb\x8f\xd0\x47\x9c\x19\x54\x85\xa6\x48\xb4\x17\xfd\xa8\x08\x11\x0e\xfc\xfb\xa4\x5d\x65\xc4\xa3\x26\x77\xda\x3a\x48', [7323199135511107817, 67890]),
+    (BLOB '\x10\x11\x12\x13', 101, BLOB '\xe5\x9e\x70\x5c\xb9\x09\xac\xab\xa7\x3c\xef\x8c\x4b\x8e\x77\x5c\xd8\x7c\xc0\x95\x6e\x40\x45\x30\x6d\x7d\xed\x41\x94\x7f\x04\xc6\x2a\xe5\xcf\x50\xa9\x31\x64\x23\xe1\xd0\x66\x32\x65\x32\xf6\xf7\xee\xea\x6c\x46\x19\x84\xc5\xa3\x39\xc3\x3d\xa6\xfe\x68\xe1\x1a', [11111, 22222]);
 
 # Should return only the matching row (first one)
 query I
-SELECT COUNT(*) FROM cudasp_scan((SELECT txid, height, tweak_key, outputs FROM test_data), BLOB '\xbfbebdbcbbbab9b8b7b6b5b4b3b2b1b0afaeadacabaaa9a8a7a6a5a4a3a2a1a0');
+SELECT COUNT(*) FROM cudasp_scan((SELECT txid, height, tweak_key, outputs FROM test_data), BLOB '\xbf\xbe\xbd\xbc\xbb\xba\xb9\xb8\xb7\xb6\xb5\xb4\xb3\xb2\xb1\xb0\xaf\xae\xad\xac\xab\xaa\xa9\xa8\xa7\xa6\xa5\xa4\xa3\xa2\xa1\xa0');
 ----
 1
 
 # Verify it's the correct row
 query I
-SELECT height FROM cudasp_scan((SELECT txid, height, tweak_key, outputs FROM test_data), BLOB '\xbfbebdbcbbbab9b8b7b6b5b4b3b2b1b0afaeadacabaaa9a8a7a6a5a4a3a2a1a0');
+SELECT height FROM cudasp_scan((SELECT txid, height, tweak_key, outputs FROM test_data), BLOB '\xbf\xbe\xbd\xbc\xbb\xba\xb9\xb8\xb7\xb6\xb5\xb4\xb3\xb2\xb1\xb0\xaf\xae\xad\xac\xab\xaa\xa9\xa8\xa7\xa6\xa5\xa4\xa3\xa2\xa1\xa0');
 ----
 100
 
@@ -37,12 +37,12 @@ CREATE TABLE large_test AS
 SELECT
     BLOB '\x00\x01\x02\x03' AS txid,
     100 AS height,
-    BLOB '\x9817f8165b81f259d928ce2ddbfc9b02070b87ce9562a055acbbdcf97e66be79b8d410fb8fd0479c195485a648b417fda808110efcfba45d65c4a32677da3a48' AS tweak_key,
+    BLOB '\x98\x17\xf8\x16\x5b\x81\xf2\x59\xd9\x28\xce\x2d\xdb\xfc\x9b\x02\x07\x0b\x87\xce\x95\x62\xa0\x55\xac\xbb\xdc\xf9\x7e\x66\xbe\x79\xb8\xd4\x10\xfb\x8f\xd0\x47\x9c\x19\x54\x85\xa6\x48\xb4\x17\xfd\xa8\x08\x11\x0e\xfc\xfb\xa4\x5d\x65\xc4\xa3\x26\x77\xda\x3a\x48' AS tweak_key,
     [7323199135511107817::BIGINT, 67890::BIGINT] AS outputs
 FROM range(20000);
 
 query I
-SELECT COUNT(*) FROM cudasp_scan((SELECT txid, height, tweak_key, outputs FROM large_test), BLOB '\xbfbebdbcbbbab9b8b7b6b5b4b3b2b1b0afaeadacabaaa9a8a7a6a5a4a3a2a1a0');
+SELECT COUNT(*) FROM cudasp_scan((SELECT txid, height, tweak_key, outputs FROM large_test), BLOB '\xbf\xbe\xbd\xbc\xbb\xba\xb9\xb8\xb7\xb6\xb5\xb4\xb3\xb2\xb1\xb0\xaf\xae\xad\xac\xab\xaa\xa9\xa8\xa7\xa6\xa5\xa4\xa3\xa2\xa1\xa0');
 ----
 20000
 
@@ -52,11 +52,11 @@ CREATE TABLE very_large_test AS
 SELECT
     BLOB '\x00\x01\x02\x03' AS txid,
     100 AS height,
-    BLOB '\x9817f8165b81f259d928ce2ddbfc9b02070b87ce9562a055acbbdcf97e66be79b8d410fb8fd0479c195485a648b417fda808110efcfba45d65c4a32677da3a48' AS tweak_key,
+    BLOB '\x98\x17\xf8\x16\x5b\x81\xf2\x59\xd9\x28\xce\x2d\xdb\xfc\x9b\x02\x07\x0b\x87\xce\x95\x62\xa0\x55\xac\xbb\xdc\xf9\x7e\x66\xbe\x79\xb8\xd4\x10\xfb\x8f\xd0\x47\x9c\x19\x54\x85\xa6\x48\xb4\x17\xfd\xa8\x08\x11\x0e\xfc\xfb\xa4\x5d\x65\xc4\xa3\x26\x77\xda\x3a\x48' AS tweak_key,
     [7323199135511107817::BIGINT, 67890::BIGINT] AS outputs
 FROM range(200000);
 
 query I
-SELECT COUNT(*) FROM cudasp_scan((SELECT txid, height, tweak_key, outputs FROM very_large_test), BLOB '\xbfbebdbcbbbab9b8b7b6b5b4b3b2b1b0afaeadacabaaa9a8a7a6a5a4a3a2a1a0');
+SELECT COUNT(*) FROM cudasp_scan((SELECT txid, height, tweak_key, outputs FROM very_large_test), BLOB '\xbf\xbe\xbd\xbc\xbb\xba\xb9\xb8\xb7\xb6\xb5\xb4\xb3\xb2\xb1\xb0\xaf\xae\xad\xac\xab\xaa\xa9\xa8\xa7\xa6\xa5\xa4\xa3\xa2\xa1\xa0');
 ----
 200000

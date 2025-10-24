@@ -93,6 +93,10 @@ def extract_int64(point):
     # Extract lower 64 bits
     return x & 0xFFFFFFFFFFFFFFFF
 
+def bytes_to_blob_literal(b):
+    """Convert bytes to DuckDB BLOB literal format with \\x escapes"""
+    return ''.join(f'\\x{byte:02x}' for byte in b)
+
 def generate_test_vector(scan_key, tweak_point, outputs_values):
     """
     Generate a test vector.
@@ -122,7 +126,9 @@ def generate_test_vector(scan_key, tweak_point, outputs_values):
 
     return {
         'scan_key_hex': scan_key_bytes.hex(),
+        'scan_key_blob': bytes_to_blob_literal(scan_key_bytes),
         'tweak_key_hex': tweak_key_bytes.hex(),
+        'tweak_key_blob': bytes_to_blob_literal(tweak_key_bytes),
         'tweak_x': tweak_point[0],
         'tweak_y': tweak_point[1],
         'outputs': outputs_values,
@@ -148,7 +154,9 @@ def main():
 
     print("Test Vector 1 (should match):")
     print(f"  scan_key: {vec1_match['scan_key_hex']}")
+    print(f"  scan_key_blob: {vec1_match['scan_key_blob']}")
     print(f"  tweak_key: {vec1_match['tweak_key_hex']}")
+    print(f"  tweak_key_blob: {vec1_match['tweak_key_blob']}")
     print(f"  outputs: {vec1_match['outputs']}")
     print(f"  computed_int64: {vec1_match['computed_int64']}")
     print(f"  should_match: {vec1_match['should_match']}")
@@ -161,7 +169,9 @@ def main():
 
     print("Test Vector 2 (should NOT match):")
     print(f"  scan_key: {vec2['scan_key_hex']}")
+    print(f"  scan_key_blob: {vec2['scan_key_blob']}")
     print(f"  tweak_key: {vec2['tweak_key_hex']}")
+    print(f"  tweak_key_blob: {vec2['tweak_key_blob']}")
     print(f"  outputs: {vec2['outputs']}")
     print(f"  computed_int64: {vec2['computed_int64']}")
     print(f"  should_match: {vec2['should_match']}")
@@ -187,26 +197,26 @@ def main():
     print("INSERT INTO real_test_data VALUES")
 
     # Vector 1 (matches)
-    txid1 = "00010203"
+    txid1_blob = '\\x00\\x01\\x02\\x03'
     outputs1_sql = "[" + ", ".join(str(x) for x in vec1_match['outputs']) + "]"
-    print(f"    (BLOB '\\x{txid1}', 100, BLOB '\\x{vec1_match['tweak_key_hex']}', {outputs1_sql}),")
+    print(f"    (BLOB '{txid1_blob}', 100, BLOB '{vec1_match['tweak_key_blob']}', {outputs1_sql}),")
 
     # Vector 2 (no match)
-    txid2 = "10111213"
+    txid2_blob = '\\x10\\x11\\x12\\x13'
     outputs2_sql = "[" + ", ".join(str(x) for x in vec2['outputs']) + "]"
-    print(f"    (BLOB '\\x{txid2}', 101, BLOB '\\x{vec2['tweak_key_hex']}', {outputs2_sql});")
+    print(f"    (BLOB '{txid2_blob}', 101, BLOB '{vec2['tweak_key_blob']}', {outputs2_sql});")
     print()
 
     print("# Should return only the matching row")
     print("query I")
-    print(f"SELECT COUNT(*) FROM cudasp_scan((SELECT txid, height, tweak_key, outputs FROM real_test_data), BLOB '\\x{vec1_match['scan_key_hex']}');")
+    print(f"SELECT COUNT(*) FROM cudasp_scan((SELECT txid, height, tweak_key, outputs FROM real_test_data), BLOB '{vec1_match['scan_key_blob']}');")
     print("----")
     print("1")
     print()
 
     print("# Verify it's the correct row")
     print("query I")
-    print(f"SELECT height FROM cudasp_scan((SELECT txid, height, tweak_key, outputs FROM real_test_data), BLOB '\\x{vec1_match['scan_key_hex']}');")
+    print(f"SELECT height FROM cudasp_scan((SELECT txid, height, tweak_key, outputs FROM real_test_data), BLOB '{vec1_match['scan_key_blob']}');")
     print("----")
     print("100")
 
