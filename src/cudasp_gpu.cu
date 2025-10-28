@@ -23,6 +23,139 @@ using Order = Fq_SECP256K1_n;
 using ECPoint = G1_1_G1SECP256K1;  // DEFINE_EC creates TYPE_NAME_CURVE_NAME
 using Solver = ECDSA_Solver;
 
+// Device function to check if a value matches any output
+__device__ bool CheckValueMatch(
+    int64_t computed_value,
+    const int64_t *outputs,
+    uint32_t offset,
+    uint32_t length) {
+
+    for (uint32_t j = 0; j < length; ++j) {
+        if (outputs[offset + j] == computed_value) {
+            return true;
+        }
+    }
+    return false;
+}
+
+// Device function to add two EC points and return X coordinate (in normal form)
+__device__ Field AddPointsAndGetX(
+    const Field &px_mont, const Field &py_mont,
+    const Field &qx_mont, const Field &qy_mont) {
+
+    // Create affine points
+    typename ECPoint::Affine p_affine;
+    p_affine.x = px_mont;
+    p_affine.y = py_mont;
+
+    typename ECPoint::Affine q_affine;
+    q_affine.x = qx_mont;
+    q_affine.y = qy_mont;
+
+    // Convert to Jacobian and add
+    ECPoint p_jac = p_affine.to_nonzero_jacobian();
+    ECPoint result = p_jac + q_affine;
+
+    // Convert back to affine and return X in normal form
+    typename ECPoint::Affine result_affine = result.to_affine();
+    return result_affine.x.from_montgomery();
+}
+
+// Device function to extract upper 64 bits from field element
+__device__ int64_t ExtractUpper64(const Field &x_normal) {
+    uint64_t computed_value_u64 = static_cast<uint64_t>(x_normal.digits[6]) |
+                                  (static_cast<uint64_t>(x_normal.digits[7]) << 32);
+    return static_cast<int64_t>(computed_value_u64);
+}
+
+// Kernel to check computed results with label checking and negation
+__global__ void CheckMatchesWithLabelsKernel(
+    const ECPoint::Base *fpm_results,    // FPM results (output_point before adding spend_pubkey)
+    const uint32_t *spend_pubkey_x,      // Spend public key X (8 u32 limbs, normal form)
+    const uint32_t *spend_pubkey_y,      // Spend public key Y (8 u32 limbs, normal form)
+    const uint32_t *label_keys_x,        // Label keys X (label_count * 8 u32 limbs, normal form)
+    const uint32_t *label_keys_y,        // Label keys Y (label_count * 8 u32 limbs, normal form)
+    uint32_t label_count,                // Number of label keys
+    const int64_t *outputs,              // Flattened outputs array
+    const uint32_t *output_offsets,      // Offset into outputs for each row
+    const uint32_t *output_lengths,      // Length of outputs list for each row
+    uint8_t *match_flags,                // Output: 1 if match found, 0 otherwise
+    uint32_t count) {                    // Number of points to process
+
+    const u32 instance = blockIdx.x * blockDim.x + threadIdx.x;
+    if (instance >= count) return;
+
+    constexpr u32 field_limbs = 8;
+
+    // Load FPM result (output_point in Montgomery form, column-major)
+    Field output_x_mont, output_y_mont;
+    #ifdef GECC_QAPW_OPT_COLUMN_MAJORED_INPUTS
+        for (u32 j = 0; j < field_limbs; j++) {
+            output_x_mont.digits[j] = fpm_results[j * count + instance];
+            output_y_mont.digits[j] = fpm_results[(field_limbs + j) * count + instance];
+        }
+    #else
+        for (u32 j = 0; j < field_limbs; j++) {
+            output_x_mont.digits[j] = fpm_results[instance * ECPoint::Affine::LIMBS + j];
+            output_y_mont.digits[j] = fpm_results[instance * ECPoint::Affine::LIMBS + field_limbs + j];
+        }
+    #endif
+
+    // Load spend_public_key and convert to Montgomery form
+    Field spend_x, spend_y;
+    for (u32 j = 0; j < field_limbs; j++) {
+        spend_x.digits[j] = spend_pubkey_x[j];
+        spend_y.digits[j] = spend_pubkey_y[j];
+    }
+    spend_x.inplace_to_montgomery();
+    spend_y.inplace_to_montgomery();
+
+    // Get output list metadata
+    uint32_t offset = output_offsets[instance];
+    uint32_t length = output_lengths[instance];
+
+    // Base case: output_point + spend_public_key
+    Field final_x_normal = AddPointsAndGetX(output_x_mont, output_y_mont, spend_x, spend_y);
+    int64_t base_value = ExtractUpper64(final_x_normal);
+
+    if (CheckValueMatch(base_value, outputs, offset, length)) {
+        match_flags[instance] = 1;
+        return;
+    }
+
+    // Try each label key
+    for (uint32_t label_idx = 0; label_idx < label_count; label_idx++) {
+        // Load label key and convert to Montgomery form
+        Field label_x, label_y;
+        for (u32 j = 0; j < field_limbs; j++) {
+            label_x.digits[j] = label_keys_x[label_idx * field_limbs + j];
+            label_y.digits[j] = label_keys_y[label_idx * field_limbs + j];
+        }
+        label_x.inplace_to_montgomery();
+        label_y.inplace_to_montgomery();
+
+        // Compute: output_point + label_key
+        Field labeled_x_normal = AddPointsAndGetX(output_x_mont, output_y_mont, label_x, label_y);
+        int64_t labeled_value = ExtractUpper64(labeled_x_normal);
+
+        // Check positive value
+        if (CheckValueMatch(labeled_value, outputs, offset, length)) {
+            match_flags[instance] = 1;
+            return;
+        }
+
+        // Check negated value
+        int64_t labeled_value_neg = -labeled_value;
+        if (CheckValueMatch(labeled_value_neg, outputs, offset, length)) {
+            match_flags[instance] = 1;
+            return;
+        }
+    }
+
+    // No match found
+    match_flags[instance] = 0;
+}
+
 // Kernel to check computed results against outputs and set match flags
 // Results are extracted from solver.R0 which has interleaved X,Y format (not Affine point format)
 __global__ void CheckMatchesKernel(
@@ -262,7 +395,11 @@ struct BatchScanState {
     uint32_t *d_output_lengths;
     uint32_t *d_spend_pubkey_x;  // Device memory for spend public key X (8 u32 limbs)
     uint32_t *d_spend_pubkey_y;  // Device memory for spend public key Y (8 u32 limbs)
-    Solver *solver;  // ECDSA solver instance
+    uint32_t *d_label_keys_x;    // Device memory for label keys X (label_count * 8 u32 limbs)
+    uint32_t *d_label_keys_y;    // Device memory for label keys Y (label_count * 8 u32 limbs)
+    uint32_t *d_fpm_results_backup;  // Backup of FPM results before adding spend_pubkey (for label checking)
+    uint32_t label_count;        // Number of label keys
+    Solver *solver;              // ECDSA solver instance
     uint32_t count;
 };
 
@@ -275,6 +412,9 @@ extern "C" void* LaunchBatchScan(
     const uint32_t *h_scalar,         // Host scalar (8 u32 limbs)
     const uint32_t *h_spend_pubkey_x, // Host spend public key X (8 u32 limbs)
     const uint32_t *h_spend_pubkey_y, // Host spend public key Y (8 u32 limbs)
+    const uint32_t *h_label_keys_x,   // Host label keys X (label_count * 8 u32 limbs, flattened)
+    const uint32_t *h_label_keys_y,   // Host label keys Y (label_count * 8 u32 limbs, flattened)
+    uint32_t label_count,             // Number of label keys
     const int64_t *h_outputs,         // Host outputs array
     const uint32_t *h_output_offsets, // Host output offsets
     const uint32_t *h_output_lengths, // Host output lengths
@@ -296,6 +436,10 @@ extern "C" void* LaunchBatchScan(
     state->d_output_lengths = nullptr;
     state->d_spend_pubkey_x = nullptr;
     state->d_spend_pubkey_y = nullptr;
+    state->d_label_keys_x = nullptr;
+    state->d_label_keys_y = nullptr;
+    state->d_fpm_results_backup = nullptr;
+    state->label_count = label_count;
     state->solver = nullptr;
     state->count = count;
 
@@ -389,6 +533,41 @@ extern "C" void* LaunchBatchScan(
     memcpy(state->d_spend_pubkey_x, h_spend_pubkey_x, field_limbs * sizeof(uint32_t));
     memcpy(state->d_spend_pubkey_y, h_spend_pubkey_y, field_limbs * sizeof(uint32_t));
 
+    // Allocate and copy label keys (if any)
+    if (label_count > 0) {
+        err = cudaMallocManaged(&state->d_label_keys_x, label_count * field_limbs * sizeof(uint32_t));
+        if (err != cudaSuccess) {
+            cudaFree(*managed_points_x);
+            cudaFree(*managed_points_y);
+            cudaFree(state->d_outputs);
+            cudaFree(state->d_output_offsets);
+            cudaFree(state->d_output_lengths);
+            cudaFree(*managed_match_flags);
+            cudaFree(state->d_spend_pubkey_x);
+            cudaFree(state->d_spend_pubkey_y);
+            delete state;
+            return nullptr;
+        }
+
+        err = cudaMallocManaged(&state->d_label_keys_y, label_count * field_limbs * sizeof(uint32_t));
+        if (err != cudaSuccess) {
+            cudaFree(*managed_points_x);
+            cudaFree(*managed_points_y);
+            cudaFree(state->d_outputs);
+            cudaFree(state->d_output_offsets);
+            cudaFree(state->d_output_lengths);
+            cudaFree(*managed_match_flags);
+            cudaFree(state->d_spend_pubkey_x);
+            cudaFree(state->d_spend_pubkey_y);
+            cudaFree(state->d_label_keys_x);
+            delete state;
+            return nullptr;
+        }
+
+        memcpy(state->d_label_keys_x, h_label_keys_x, label_count * field_limbs * sizeof(uint32_t));
+        memcpy(state->d_label_keys_y, h_label_keys_y, label_count * field_limbs * sizeof(uint32_t));
+    }
+
     // Create fresh solver for this batch
     state->solver = new Solver();
 
@@ -404,6 +583,9 @@ extern "C" int RunBatchScanKernels(
     const uint32_t *h_scalar,        // Scalar for all multiplications
     const uint32_t *h_spend_pubkey_x, // Host spend public key X (8 u32 limbs)
     const uint32_t *h_spend_pubkey_y, // Host spend public key Y (8 u32 limbs)
+    const uint32_t *h_label_keys_x,   // Host label keys X (label_count * 8 u32 limbs)
+    const uint32_t *h_label_keys_y,   // Host label keys Y (label_count * 8 u32 limbs)
+    uint32_t label_count,             // Number of label keys
     uint8_t *managed_match_flags,
     uint32_t count) {
 
@@ -619,65 +801,31 @@ extern "C" int RunBatchScanKernels(
 
     cudaFree(d_hash_scalars);  // No longer needed
 
-    // Step 6: Add spend_public_key to each output point
-    // This computes: (hash × G) + spend_public_key
-    AddSpendPublicKeyKernel<<<num_blocks, threads_per_block>>>(
-        count, state->d_spend_pubkey_x, state->d_spend_pubkey_y, d_fpm_results
+    // Step 6: Check matches with label support
+    // This will: (1) try base case: output_point + spend_pubkey
+    //           (2) for each label: try output_point + label_key (and negated)
+    CheckMatchesWithLabelsKernel<<<num_blocks, threads_per_block>>>(
+        d_fpm_results,
+        state->d_spend_pubkey_x,
+        state->d_spend_pubkey_y,
+        state->d_label_keys_x,
+        state->d_label_keys_y,
+        state->label_count,
+        state->d_outputs,
+        state->d_output_offsets,
+        state->d_output_lengths,
+        managed_match_flags,
+        count
     );
 
     err = cudaDeviceSynchronize();
     if (err != cudaSuccess) {
-        printf("AddSpendPublicKeyKernel error: %s\n", cudaGetErrorString(err));
+        printf("CheckMatchesWithLabelsKernel error: %s\n", cudaGetErrorString(err));
         cudaFree(d_fpm_results);
         return -1;
     }
-
-    // Step 7: Extract X coordinates from final results
-    // Results are in affine format stored by FixedPointMultiplyKernel
-    constexpr u32 field_limbs = 8;  // 8 u32 limbs for 256-bit field
-
-    uint32_t *result_x_coords;
-    err = cudaMallocManaged(&result_x_coords, count * field_limbs * sizeof(uint32_t));
-    if (err != cudaSuccess) {
-        printf("cudaMallocManaged for result_x_coords error: %s\n", cudaGetErrorString(err));
-        cudaFree(d_fpm_results);
-        return -1;
-    }
-
-    // Extract X coordinates from affine results (column-major format)
-    // FixedPointMultiplyKernel stores: X at [j * count + i], Y at [field_limbs * count + j * count + i]
-    #ifdef GECC_QAPW_OPT_COLUMN_MAJORED_INPUTS
-        for (u32 i = 0; i < count; i++) {
-            for (u32 j = 0; j < field_limbs; j++) {
-                result_x_coords[i * field_limbs + j] = d_fpm_results[j * count + i];
-            }
-        }
-    #else
-        for (u32 i = 0; i < count; i++) {
-            for (u32 j = 0; j < field_limbs; j++) {
-                result_x_coords[i * field_limbs + j] = d_fpm_results[i * ECPoint::Affine::LIMBS + j];
-            }
-        }
-    #endif
 
     cudaFree(d_fpm_results);  // No longer needed
-
-    // Step 8: Check matches against expected outputs
-    CheckMatchesKernel<<<num_blocks, threads_per_block>>>(
-        result_x_coords,  // Extracted X coordinates (in Montgomery form)
-        state->d_outputs, state->d_output_offsets, state->d_output_lengths,
-        managed_match_flags, count
-    );
-
-    err = cudaDeviceSynchronize();
-    if (err != cudaSuccess) {
-        printf("CheckMatchesKernel error: %s\n", cudaGetErrorString(err));
-        cudaFree(result_x_coords);
-        return -1;
-    }
-
-    // Free extracted coordinates
-    cudaFree(result_x_coords);
 
     return 0;
 }
@@ -694,6 +842,9 @@ extern "C" void FreeBatchScanState(void *state_handle) {
     if (state->d_output_lengths) cudaFree(state->d_output_lengths);
     if (state->d_spend_pubkey_x) cudaFree(state->d_spend_pubkey_x);
     if (state->d_spend_pubkey_y) cudaFree(state->d_spend_pubkey_y);
+    if (state->d_label_keys_x) cudaFree(state->d_label_keys_x);
+    if (state->d_label_keys_y) cudaFree(state->d_label_keys_y);
+    if (state->d_fpm_results_backup) cudaFree(state->d_fpm_results_backup);
 
     // Delete solver
     if (state->solver) delete state->solver;

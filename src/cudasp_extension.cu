@@ -21,6 +21,9 @@ extern "C" {
 	    const uint32_t *h_scalar,
 	    const uint32_t *h_spend_pubkey_x,
 	    const uint32_t *h_spend_pubkey_y,
+	    const uint32_t *h_label_keys_x,
+	    const uint32_t *h_label_keys_y,
+	    uint32_t label_count,
 	    const int64_t *h_outputs,
 	    const uint32_t *h_output_offsets,
 	    const uint32_t *h_output_lengths,
@@ -35,6 +38,9 @@ extern "C" {
 	    const uint32_t *h_scalar,
 	    const uint32_t *h_spend_pubkey_x,
 	    const uint32_t *h_spend_pubkey_y,
+	    const uint32_t *h_label_keys_x,
+	    const uint32_t *h_label_keys_y,
+	    uint32_t label_count,
 	    uint8_t *managed_match_flags,
 	    uint32_t count);
 
@@ -86,6 +92,9 @@ struct CudaspScanBindData : public TableFunctionData {
 
 	// Spend public key for EC point addition (shared across all rows) - owned copy
 	std::string spend_public_key_data;
+
+	// Label keys for checking alternative outputs (shared across all rows) - owned copies
+	std::vector<std::string> label_keys_data;
 };
 
 struct CudaspScanLocalState : public LocalTableFunctionState {
@@ -244,6 +253,17 @@ static void ProcessBatch(CudaspScanLocalState &local_state, const CudaspScanBind
 	const uint8_t* spend_pubkey_data = reinterpret_cast<const uint8_t*>(bind_data.spend_public_key_data.data());
 	ConvertTweakKeyToU32(spend_pubkey_data, h_spend_pubkey_x, h_spend_pubkey_y);
 
+	// Convert label keys from BLOB to u32 format (flattened array)
+	idx_t label_count = bind_data.label_keys_data.size();
+	std::vector<uint32_t> h_label_keys_x(label_count * field_limbs);
+	std::vector<uint32_t> h_label_keys_y(label_count * field_limbs);
+	for (idx_t i = 0; i < label_count; i++) {
+		const uint8_t* label_key_data = reinterpret_cast<const uint8_t*>(bind_data.label_keys_data[i].data());
+		ConvertTweakKeyToU32(label_key_data,
+		                     &h_label_keys_x[i * field_limbs],
+		                     &h_label_keys_y[i * field_limbs]);
+	}
+
 	// Prepare output offsets and lengths as uint32_t
 	std::vector<uint32_t> h_output_offsets(batch_size);
 	std::vector<uint32_t> h_output_lengths(batch_size);
@@ -259,6 +279,9 @@ static void ProcessBatch(CudaspScanLocalState &local_state, const CudaspScanBind
 	    h_scalar,
 	    h_spend_pubkey_x,
 	    h_spend_pubkey_y,
+	    h_label_keys_x.data(),
+	    h_label_keys_y.data(),
+	    static_cast<uint32_t>(label_count),
 	    local_state.accumulated_outputs.data(),
 	    h_output_offsets.data(),
 	    h_output_lengths.data(),
@@ -295,6 +318,16 @@ static void ProcessBatch(CudaspScanLocalState &local_state, const CudaspScanBind
 	    ConvertTweakKeyToU32(reinterpret_cast<const uint8_t*>(bind_data.spend_public_key_data.data()),
 	                         h_spend_pubkey_x_local, h_spend_pubkey_y_local);
 
+	    // Prepare label keys for kernel call
+	    std::vector<uint32_t> h_label_keys_x_local(label_count * 8);
+	    std::vector<uint32_t> h_label_keys_y_local(label_count * 8);
+	    for (idx_t i = 0; i < label_count; i++) {
+	        const uint8_t* label_key_data = reinterpret_cast<const uint8_t*>(bind_data.label_keys_data[i].data());
+	        ConvertTweakKeyToU32(label_key_data,
+	                             &h_label_keys_x_local[i * 8],
+	                             &h_label_keys_y_local[i * 8]);
+	    }
+
 	    // Now run the GPU kernels
 	    int kernel_result = RunBatchScanKernels(
 	        state_handle,
@@ -303,6 +336,9 @@ static void ProcessBatch(CudaspScanLocalState &local_state, const CudaspScanBind
 	        h_scalar_local,
 	        h_spend_pubkey_x_local,
 	        h_spend_pubkey_y_local,
+	        h_label_keys_x_local.data(),
+	        h_label_keys_y_local.data(),
+	        static_cast<uint32_t>(label_count),
 	        managed_match_flags,
 	        static_cast<uint32_t>(batch_size)
 	    );
@@ -346,9 +382,9 @@ static bool ShouldProcessBatch(const CudaspScanLocalState &local_state) {
 
 static unique_ptr<FunctionData> CudaspScanBind(ClientContext &context, TableFunctionBindInput &input,
                                                       vector<LogicalType> &return_types, vector<string> &names) {
-	// Validate input: expects TABLE, scan_private_key BLOB, and spend_public_key BLOB
-	if (input.inputs.size() != 3) {
-		throw InvalidInputException("cudasp_scan requires 3 arguments: TABLE, scan_private_key BLOB, and spend_public_key BLOB");
+	// Validate input: expects TABLE, scan_private_key BLOB, spend_public_key BLOB, and label_keys LIST
+	if (input.inputs.size() != 4) {
+		throw InvalidInputException("cudasp_scan requires 4 arguments: TABLE, scan_private_key BLOB, spend_public_key BLOB, and label_keys LIST[BLOB]");
 	}
 
 	// Validate scan_private_key parameter
@@ -375,6 +411,27 @@ static unique_ptr<FunctionData> CudaspScanBind(ClientContext &context, TableFunc
 		throw InvalidInputException("spend_public_key must be exactly 64 bytes, got %llu bytes", spend_public_key.GetSize());
 	}
 
+	// Validate label_keys parameter (LIST of BLOBs)
+	auto &label_keys_value = input.inputs[3];
+	if (label_keys_value.type().id() != LogicalTypeId::LIST) {
+		throw InvalidInputException("Fourth argument must be a LIST[BLOB] (label keys)");
+	}
+
+	// Parse label_keys list
+	std::vector<std::string> label_keys;
+	auto &list_value = ListValue::GetChildren(label_keys_value);
+	for (idx_t i = 0; i < list_value.size(); i++) {
+		auto &label_key_value = list_value[i];
+		if (label_key_value.type().id() != LogicalTypeId::BLOB) {
+			throw InvalidInputException("All elements in label_keys must be BLOBs");
+		}
+		string_t label_key = StringValue::Get(label_key_value);
+		if (label_key.GetSize() != CudaspScanBindData::TWEAK_KEY_SIZE) {
+			throw InvalidInputException("Each label key must be exactly 64 bytes, got %llu bytes", label_key.GetSize());
+		}
+		label_keys.push_back(std::string(label_key.GetData(), label_key.GetSize()));
+	}
+
 	// Set return types: txid (BLOB), height (INTEGER), tweak_key (BLOB)
 	return_types.push_back(LogicalType::BLOB);    // txid
 	return_types.push_back(LogicalType::INTEGER); // height
@@ -388,6 +445,8 @@ static unique_ptr<FunctionData> CudaspScanBind(ClientContext &context, TableFunc
 	bind_data->scan_private_key_data = std::string(scan_private_key.GetData(), scan_private_key.GetSize());
 	// Copy the spend_public_key data into owned memory
 	bind_data->spend_public_key_data = std::string(spend_public_key.GetData(), spend_public_key.GetSize());
+	// Copy label keys
+	bind_data->label_keys_data = std::move(label_keys);
 	return bind_data;
 }
 
@@ -567,7 +626,7 @@ static OperatorFinalizeResultType CudaspScanFinalFunction(ExecutionContext &cont
 static void LoadInternal(ExtensionLoader &loader) {
 	TableFunctionSet cudasp_scan("cudasp_scan");
 
-	TableFunction func({LogicalType::TABLE, LogicalType::BLOB, LogicalType::BLOB}, nullptr, CudaspScanBind, CudaspScanInit, CudaspScanLocalInit);
+	TableFunction func({LogicalType::TABLE, LogicalType::BLOB, LogicalType::BLOB, LogicalType::LIST(LogicalType::BLOB)}, nullptr, CudaspScanBind, CudaspScanInit, CudaspScanLocalInit);
 	func.in_out_function = CudaspScanFunction;
 	func.in_out_function_final = CudaspScanFinalFunction;
 
