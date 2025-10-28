@@ -672,10 +672,14 @@ extern "C" int RunBatchScanKernels(
     }
 
     // Run EC multiplication (matching ecdsa_ec_pmul call)
-    // gECC correctness test uses MAX_SM_NUMS blocks (SM count) with 256 threads
-    // This seems to be required for the algorithm to work correctly
+    // Calculate block_num to ensure block_num * threads_per_block >= count
     u32 max_thread_per_block = 256;
-    u32 block_num = MAX_SM_NUMS;  // Use SM count like gECC test
+    u32 block_num = (count + max_thread_per_block - 1) / max_thread_per_block;
+
+    // Ensure we use at least MAX_SM_NUMS blocks for efficiency (if count allows)
+    if (block_num < MAX_SM_NUMS && count >= MAX_SM_NUMS * max_thread_per_block) {
+        block_num = MAX_SM_NUMS;
+    }
 
     solver->ecdsa_ec_pmul(block_num, max_thread_per_block, true);  // true = unknown points
 
