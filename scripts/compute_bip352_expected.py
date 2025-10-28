@@ -139,9 +139,21 @@ print(f"  output_point.x = {output_point[0]:064x}")
 print(f"  output_point.y = {output_point[1]:064x}")
 print()
 
-# Step 5: Extract lower 64 bits
-print("Step 5: Extract lower 64 bits of output_point.x")
-lower_64_bits = output_point[0] & 0xFFFFFFFFFFFFFFFF
+# Step 5: Add spend_public_key to output_point
+print("Step 5: Add spend_public_key (using G for test)")
+# For testing, use generator point G as spend_public_key
+spend_public_key = (Gx, Gy)
+print(f"  spend_public_key.x = {spend_public_key[0]:064x}")
+print(f"  spend_public_key.y = {spend_public_key[1]:064x}")
+
+final_point = point_add(output_point, spend_public_key)
+print(f"  final_point.x = {final_point[0]:064x}")
+print(f"  final_point.y = {final_point[1]:064x}")
+print()
+
+# Step 6: Extract lower 64 bits
+print("Step 6: Extract lower 64 bits of final_point.x")
+lower_64_bits = final_point[0] & 0xFFFFFFFFFFFFFFFF
 print(f"  Lower 64 bits (hex): {lower_64_bits:016x}")
 print(f"  Lower 64 bits (unsigned): {lower_64_bits}")
 print(f"  Lower 64 bits (signed int64): {lower_64_bits if lower_64_bits < (1 << 63) else lower_64_bits - (1 << 64)}")
@@ -149,3 +161,11 @@ print()
 
 print("=== Expected value for test ===")
 print(f"Row 0 expected output: {lower_64_bits if lower_64_bits < (1 << 63) else lower_64_bits - (1 << 64)}")
+print()
+print("=== Spend public key (64 bytes, little-endian x||y) ===")
+# Convert to little-endian bytes for BLOB
+spend_x_bytes = spend_public_key[0].to_bytes(32, 'little')
+spend_y_bytes = spend_public_key[1].to_bytes(32, 'little')
+spend_pubkey_blob = spend_x_bytes + spend_y_bytes
+print(f"BLOB '\\x{spend_pubkey_blob.hex()}'")
+print(f"  (formatted: {' '.join(f'\\x{b:02x}' for b in spend_pubkey_blob)})")

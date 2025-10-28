@@ -184,11 +184,81 @@ __global__ void FixedPointMultiplyKernel(
     #endif
 }
 
+// Kernel for EC point addition: Adds spend_public_key to each output point
+// Input points are in affine coordinates (column-major, Montgomery form)
+// Output: Updated points in place
+__global__ void AddSpendPublicKeyKernel(
+    u32 count,
+    const uint32_t *spend_pubkey_x,  // Spend public key X (8 u32 limbs, little-endian, normal form)
+    const uint32_t *spend_pubkey_y,  // Spend public key Y (8 u32 limbs, little-endian, normal form)
+    ECPoint::Base *points) {         // Input/Output: EC points (affine coordinates)
+
+    u32 instance = blockIdx.x * blockDim.x + threadIdx.x;
+    if (instance >= count) return;
+
+    constexpr u32 field_limbs = 8;
+
+    // Load input point (in Montgomery form, column-major)
+    Field px_mont, py_mont;
+    #ifdef GECC_QAPW_OPT_COLUMN_MAJORED_INPUTS
+        for (u32 j = 0; j < field_limbs; j++) {
+            px_mont.digits[j] = points[j * count + instance];
+            py_mont.digits[j] = points[(field_limbs + j) * count + instance];
+        }
+    #else
+        for (u32 j = 0; j < field_limbs; j++) {
+            px_mont.digits[j] = points[instance * ECPoint::Affine::LIMBS + j];
+            py_mont.digits[j] = points[instance * ECPoint::Affine::LIMBS + field_limbs + j];
+        }
+    #endif
+
+    // Load spend_public_key (in normal form, little-endian u32 limbs)
+    Field spend_x, spend_y;
+    for (u32 j = 0; j < field_limbs; j++) {
+        spend_x.digits[j] = spend_pubkey_x[j];
+        spend_y.digits[j] = spend_pubkey_y[j];
+    }
+
+    // Convert spend_public_key to Montgomery form
+    spend_x.inplace_to_montgomery();
+    spend_y.inplace_to_montgomery();
+
+    // Create Affine point for input (already in Montgomery form)
+    typename ECPoint::Affine p_affine;
+    p_affine.x = px_mont;
+    p_affine.y = py_mont;
+
+    // Convert to Jacobian for addition
+    ECPoint p1 = p_affine.to_nonzero_jacobian();
+
+    // Create Affine point for spend_public_key (now in Montgomery form)
+    typename ECPoint::Affine spend_affine;
+    spend_affine.x = spend_x;
+    spend_affine.y = spend_y;
+
+    // Perform EC point addition using mixed addition: p1 + spend_affine
+    ECPoint result = p1 + spend_affine;
+
+    // Convert result back to affine coordinates
+    typename ECPoint::Affine result_affine = result.to_affine();
+
+    // Store result (in Montgomery form, column-major)
+    #ifdef GECC_QAPW_OPT_COLUMN_MAJORED_INPUTS
+        result_affine.x.store_arbitrary(points, count, instance, 0);
+        result_affine.y.store_arbitrary(points + count * Field::LIMBS, count, instance, 0);
+    #else
+        result_affine.x.store(points + instance * ECPoint::Affine::LIMBS, 0, 0, 0);
+        result_affine.y.store(points + instance * ECPoint::Affine::LIMBS + Field::LIMBS, 0, 0, 0);
+    #endif
+}
+
 // Per-batch state to hold auxiliary data between LaunchBatchScan and RunBatchScanKernels
 struct BatchScanState {
     int64_t *d_outputs;
     uint32_t *d_output_offsets;
     uint32_t *d_output_lengths;
+    uint32_t *d_spend_pubkey_x;  // Device memory for spend public key X (8 u32 limbs)
+    uint32_t *d_spend_pubkey_y;  // Device memory for spend public key Y (8 u32 limbs)
     Solver *solver;  // ECDSA solver instance
     uint32_t count;
 };
@@ -200,6 +270,8 @@ extern "C" void* LaunchBatchScan(
     uint32_t **managed_points_x,      // Will allocate managed memory for input points
     uint32_t **managed_points_y,      // Will allocate managed memory for input points
     const uint32_t *h_scalar,         // Host scalar (8 u32 limbs)
+    const uint32_t *h_spend_pubkey_x, // Host spend public key X (8 u32 limbs)
+    const uint32_t *h_spend_pubkey_y, // Host spend public key Y (8 u32 limbs)
     const int64_t *h_outputs,         // Host outputs array
     const uint32_t *h_output_offsets, // Host output offsets
     const uint32_t *h_output_lengths, // Host output lengths
@@ -219,6 +291,8 @@ extern "C" void* LaunchBatchScan(
     state->d_outputs = nullptr;
     state->d_output_offsets = nullptr;
     state->d_output_lengths = nullptr;
+    state->d_spend_pubkey_x = nullptr;
+    state->d_spend_pubkey_y = nullptr;
     state->solver = nullptr;
     state->count = count;
 
@@ -276,10 +350,41 @@ extern "C" void* LaunchBatchScan(
         return nullptr;
     }
 
+    // Allocate device memory for spend public key (8 u32 limbs each for x and y)
+    constexpr u32 field_limbs = 8;
+    err = cudaMallocManaged(&state->d_spend_pubkey_x, field_limbs * sizeof(uint32_t));
+    if (err != cudaSuccess) {
+        cudaFree(*managed_points_x);
+        cudaFree(*managed_points_y);
+        cudaFree(state->d_outputs);
+        cudaFree(state->d_output_offsets);
+        cudaFree(state->d_output_lengths);
+        cudaFree(*managed_match_flags);
+        delete state;
+        return nullptr;
+    }
+
+    err = cudaMallocManaged(&state->d_spend_pubkey_y, field_limbs * sizeof(uint32_t));
+    if (err != cudaSuccess) {
+        cudaFree(*managed_points_x);
+        cudaFree(*managed_points_y);
+        cudaFree(state->d_outputs);
+        cudaFree(state->d_output_offsets);
+        cudaFree(state->d_output_lengths);
+        cudaFree(*managed_match_flags);
+        cudaFree(state->d_spend_pubkey_x);
+        delete state;
+        return nullptr;
+    }
+
     // Copy outputs metadata
     memcpy(state->d_outputs, h_outputs, outputs_size * sizeof(int64_t));
     memcpy(state->d_output_offsets, h_output_offsets, count * sizeof(uint32_t));
     memcpy(state->d_output_lengths, h_output_lengths, count * sizeof(uint32_t));
+
+    // Copy spend public key
+    memcpy(state->d_spend_pubkey_x, h_spend_pubkey_x, field_limbs * sizeof(uint32_t));
+    memcpy(state->d_spend_pubkey_y, h_spend_pubkey_y, field_limbs * sizeof(uint32_t));
 
     // Create fresh solver for this batch
     state->solver = new Solver();
@@ -294,6 +399,8 @@ extern "C" int RunBatchScanKernels(
     uint32_t *managed_points_x,
     uint32_t *managed_points_y,
     const uint32_t *h_scalar,        // Scalar for all multiplications
+    const uint32_t *h_spend_pubkey_x, // Host spend public key X (8 u32 limbs)
+    const uint32_t *h_spend_pubkey_y, // Host spend public key Y (8 u32 limbs)
     uint8_t *managed_match_flags,
     uint32_t count) {
 
@@ -509,7 +616,20 @@ extern "C" int RunBatchScanKernels(
 
     cudaFree(d_hash_scalars);  // No longer needed
 
-    // Step 6: Extract X coordinates from fixed-point multiply results
+    // Step 6: Add spend_public_key to each output point
+    // This computes: (hash × G) + spend_public_key
+    AddSpendPublicKeyKernel<<<num_blocks, threads_per_block>>>(
+        count, state->d_spend_pubkey_x, state->d_spend_pubkey_y, d_fpm_results
+    );
+
+    err = cudaDeviceSynchronize();
+    if (err != cudaSuccess) {
+        printf("AddSpendPublicKeyKernel error: %s\n", cudaGetErrorString(err));
+        cudaFree(d_fpm_results);
+        return -1;
+    }
+
+    // Step 7: Extract X coordinates from final results
     // Results are in affine format stored by FixedPointMultiplyKernel
     constexpr u32 field_limbs = 8;  // 8 u32 limbs for 256-bit field
 
@@ -539,7 +659,7 @@ extern "C" int RunBatchScanKernels(
 
     cudaFree(d_fpm_results);  // No longer needed
 
-    // Step 7: Check matches against expected outputs
+    // Step 8: Check matches against expected outputs
     CheckMatchesKernel<<<num_blocks, threads_per_block>>>(
         result_x_coords,  // Extracted X coordinates (in Montgomery form)
         state->d_outputs, state->d_output_offsets, state->d_output_lengths,
@@ -569,6 +689,8 @@ extern "C" void FreeBatchScanState(void *state_handle) {
     if (state->d_outputs) cudaFree(state->d_outputs);
     if (state->d_output_offsets) cudaFree(state->d_output_offsets);
     if (state->d_output_lengths) cudaFree(state->d_output_lengths);
+    if (state->d_spend_pubkey_x) cudaFree(state->d_spend_pubkey_x);
+    if (state->d_spend_pubkey_y) cudaFree(state->d_spend_pubkey_y);
 
     // Delete solver
     if (state->solver) delete state->solver;
