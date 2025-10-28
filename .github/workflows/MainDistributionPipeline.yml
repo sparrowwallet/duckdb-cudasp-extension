@@ -19,6 +19,7 @@ jobs:
       duckdb_version: v1.4.1
       ci_tools_version: v1.4.1
       extension_name: cudasp
+      include_archs: 'linux_amd64;linux_arm64'
 
   code-quality-check:
     name: Code Quality Check
