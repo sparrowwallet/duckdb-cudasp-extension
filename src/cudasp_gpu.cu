@@ -4,10 +4,12 @@
 #include "gecc.h"
 #include "gecc/arith.h"
 #include "gecc/ecdsa.h"
+#include "gecc/hash/sha256.h"
 
 using namespace gecc;
 using namespace arith;
 using namespace ecdsa;
+using namespace hash;
 
 // Define field and EC types for secp256k1 (matching gECC test naming)
 // secp256k1 has a=0, so use DBL_FLAG=1 for the a=0 optimized doubling formula
@@ -69,6 +71,117 @@ __global__ void CheckMatchesKernel(
 
     // Write match flag
     match_flags[instance] = found ? 1 : 0;
+}
+
+// Kernel to serialize EC points from R0 to compressed SEC1 format + 4 zero bytes
+// R0 format: Column-major with X at [j * count + i] for point i, limb j
+// Output: 33-byte compressed SEC1 (prefix || X) + 4 zero bytes = 37 bytes per point
+__global__ void SerializeToCompressedSEC1Kernel(
+    const uint32_t *R0,             // Input: EC points in column-major format
+    uint8_t *serialized,            // Output: serialized points (37 bytes each)
+    uint32_t count) {               // Number of points
+
+    const u32 instance = blockIdx.x * blockDim.x + threadIdx.x;
+    if (instance >= count) return;
+
+    constexpr u32 field_limbs = 8;  // 8 u32 limbs for 256-bit field
+
+    // Load X and Y coordinates from column-major R0 (in Montgomery form)
+    Field x_mont, y_mont;
+    for (u32 j = 0; j < field_limbs; ++j) {
+        x_mont.digits[j] = R0[j * count + instance];                    // X coord
+        y_mont.digits[j] = R0[(field_limbs + j) * count + instance];    // Y coord
+    }
+
+    // Convert from Montgomery form to normal form
+    Field x_normal = x_mont.from_montgomery();
+    Field y_normal = y_mont.from_montgomery();
+
+    // Compute Y parity (even = 0x02, odd = 0x03)
+    uint8_t prefix = 0x02 + (y_normal.digits[0] & 1);
+
+    // Output pointer for this point (37 bytes)
+    uint8_t *output = serialized + instance * 37;
+
+    // Write prefix
+    output[0] = prefix;
+
+    // Write X coordinate (32 bytes, little-endian limbs to big-endian bytes)
+    for (u32 i = 0; i < 8; ++i) {
+        uint32_t limb = x_normal.digits[7 - i];  // Reverse limb order for big-endian
+        output[1 + i * 4 + 0] = (limb >> 24) & 0xFF;
+        output[1 + i * 4 + 1] = (limb >> 16) & 0xFF;
+        output[1 + i * 4 + 2] = (limb >> 8) & 0xFF;
+        output[1 + i * 4 + 3] = (limb >> 0) & 0xFF;
+    }
+
+    // Append 4 zero bytes
+    output[33] = 0x00;
+    output[34] = 0x00;
+    output[35] = 0x00;
+    output[36] = 0x00;
+}
+
+// Kernel to compute BIP0352 tagged hashes on serialized EC points
+// Each thread computes: SHA256(SHA256(tag) || SHA256(tag) || serialized_point)
+__global__ void ComputeTaggedHashesKernel(
+    const uint8_t *serialized,      // Input: serialized points (37 bytes each)
+    uint8_t *hashes,                // Output: SHA256 hashes (32 bytes each)
+    uint32_t count) {               // Number of points
+
+    const u32 instance = blockIdx.x * blockDim.x + threadIdx.x;
+    if (instance >= count) return;
+
+    // Tag for BIP-352 Silent Payments
+    const char tag_str[] = "BIP0352/SharedSecret";
+    const uint8_t *tag = reinterpret_cast<const uint8_t*>(tag_str);
+    const uint64_t tag_len = 20;  // Length of "BIP0352/SharedSecret" (B-I-P-0-3-5-2-/-S-h-a-r-e-d-S-e-c-r-e-t = 20 chars)
+
+    // Input message: 37 bytes (33-byte compressed point + 4 zero bytes)
+    const uint8_t *msg = serialized + instance * 37;
+    const uint64_t msg_len = 37;
+
+    // Output hash
+    uint8_t *hash = hashes + instance * 32;
+
+    // Compute tagged hash
+    tagged_hash(tag, tag_len, msg, msg_len, hash);
+}
+
+// Kernel for fixed-point multiplication: Computes hash × G for each hash
+// This uses the precomputed table from ECDSACONST.d_mul_table[]
+__global__ void FixedPointMultiplyKernel(
+    u32 count,
+    Order::Base *scalars,           // Input: scalar values (hashes converted to scalars)
+    ECPoint::Base *results) {       // Output: EC points (affine coordinates)
+
+    u32 instance = blockIdx.x * blockDim.x + threadIdx.x;
+    if (instance >= count) return;
+
+    // Load scalar
+    Order s;
+    #ifdef GECC_QAPW_OPT_COLUMN_MAJORED_INPUTS
+        s.load_arbitrary(scalars, count, instance, 0);
+    #else
+        s.load(scalars + instance * Order::LIMBS, 0, 0, 0);
+    #endif
+
+    // Compute s × G using fixed-point multiplication
+    // This reads from precomputed table in device constant memory
+    ECPoint p = ECPoint::zero();
+    Solver::fixed_point_mult(p, s, true);
+
+    // Convert Jacobian to affine coordinates
+    typename ECPoint::Affine result = p.to_affine();
+
+    // Store result
+    #ifdef GECC_QAPW_OPT_COLUMN_MAJORED_INPUTS
+        result.x.store_arbitrary(results, count, instance, 0);
+        result.y.store_arbitrary(results + count * Field::LIMBS, count, instance, 0);
+    #else
+        result.x.store(results + instance * ECPoint::Affine::LIMBS, 0, 0, 0);
+        result.y.store(results + instance * ECPoint::Affine::LIMBS + Field::LIMBS, 0, 0, 0);
+    #endif
 }
 
 // Per-batch state to hold auxiliary data between LaunchBatchScan and RunBatchScanKernels
@@ -281,36 +394,152 @@ extern "C" int RunBatchScanKernels(
     // Check for multiplication errors
     err = cudaPeekAtLastError();
     if (err != cudaSuccess) {
-        printf("ecdsa_ec_pmul error: %s\n", cudaGetErrorString(err));
+        printf("ecdsa_ec_pmul (first) error: %s\n", cudaGetErrorString(err));
         return -1;
     }
 
-    // Extract X coordinates from interleaved R0 format
-    // R0 layout: Point i has X at [i * field_limbs * 2], Y at [i * field_limbs * 2 + field_limbs]
-    // See gECC/ECDSA_CORRECTNESS_TEST.md lines 99-111 for details
+    // === BIP-352 Silent Payment Pipeline ===
+    // Step 1: Serialize shared secrets to compressed SEC1 format + 4 zero bytes (37 bytes each)
+    uint8_t *d_serialized;
+    err = cudaMallocManaged(&d_serialized, count * 37);
+    if (err != cudaSuccess) {
+        printf("cudaMallocManaged for d_serialized error: %s\n", cudaGetErrorString(err));
+        return -1;
+    }
+
+    int threads_per_block = 256;
+    int num_blocks = (count + threads_per_block - 1) / threads_per_block;
+
+    SerializeToCompressedSEC1Kernel<<<num_blocks, threads_per_block>>>(
+        solver->R0, d_serialized, count
+    );
+
+    err = cudaDeviceSynchronize();
+    if (err != cudaSuccess) {
+        printf("SerializeToCompressedSEC1Kernel error: %s\n", cudaGetErrorString(err));
+        cudaFree(d_serialized);
+        return -1;
+    }
+
+    // Step 2: Compute BIP-352 tagged hashes (32 bytes each)
+    uint8_t *d_hashes;
+    err = cudaMallocManaged(&d_hashes, count * 32);
+    if (err != cudaSuccess) {
+        printf("cudaMallocManaged for d_hashes error: %s\n", cudaGetErrorString(err));
+        cudaFree(d_serialized);
+        return -1;
+    }
+
+    ComputeTaggedHashesKernel<<<num_blocks, threads_per_block>>>(
+        d_serialized, d_hashes, count
+    );
+
+    err = cudaDeviceSynchronize();
+    if (err != cudaSuccess) {
+        printf("ComputeTaggedHashesKernel error: %s\n", cudaGetErrorString(err));
+        cudaFree(d_serialized);
+        cudaFree(d_hashes);
+        return -1;
+    }
+
+    cudaFree(d_serialized);  // No longer needed
+
+    // Step 3: Convert hashes to Order scalars for fixed-point multiplication
+    Order::Base *d_hash_scalars;
+    err = cudaMallocManaged(&d_hash_scalars, Order::SIZE * count);
+    if (err != cudaSuccess) {
+        printf("cudaMallocManaged for d_hash_scalars error: %s\n", cudaGetErrorString(err));
+        cudaFree(d_hashes);
+        return -1;
+    }
+
+    // Convert 32-byte hashes (big-endian) to Order::Base (u32) limbs in column-major format
+    #ifdef GECC_QAPW_OPT_COLUMN_MAJORED_INPUTS
+        // Column-major: limb j of scalar i is at [j * count + i]
+        for (u32 i = 0; i < count; i++) {
+            uint8_t *hash = d_hashes + i * 32;
+            // Hash is big-endian: hash[0] is most significant byte
+            // Convert to u32 limbs in little-endian order
+            for (u32 j = 0; j < Order::LIMBS; j++) {
+                // Each u32 limb is 4 bytes, starting from least significant
+                uint32_t limb = (static_cast<uint32_t>(hash[31 - j * 4 - 0]) << 0) |
+                                (static_cast<uint32_t>(hash[31 - j * 4 - 1]) << 8) |
+                                (static_cast<uint32_t>(hash[31 - j * 4 - 2]) << 16) |
+                                (static_cast<uint32_t>(hash[31 - j * 4 - 3]) << 24);
+                d_hash_scalars[j * count + i] = limb;
+            }
+        }
+    #else
+        // Row-major: limb j of scalar i is at [i * Order::LIMBS + j]
+        for (u32 i = 0; i < count; i++) {
+            uint8_t *hash = d_hashes + i * 32;
+            for (u32 j = 0; j < Order::LIMBS; j++) {
+                uint32_t limb = (static_cast<uint32_t>(hash[31 - j * 4 - 0]) << 0) |
+                                (static_cast<uint32_t>(hash[31 - j * 4 - 1]) << 8) |
+                                (static_cast<uint32_t>(hash[31 - j * 4 - 2]) << 16) |
+                                (static_cast<uint32_t>(hash[31 - j * 4 - 3]) << 24);
+                d_hash_scalars[i * Order::LIMBS + j] = limb;
+            }
+        }
+    #endif
+
+    cudaFree(d_hashes);  // No longer needed
+
+    // Step 4: Allocate output buffer for fixed-point multiply results
+    ECPoint::Base *d_fpm_results;
+    err = cudaMallocManaged(&d_fpm_results, ECPoint::Affine::SIZE * count);
+    if (err != cudaSuccess) {
+        printf("cudaMallocManaged for d_fpm_results error: %s\n", cudaGetErrorString(err));
+        cudaFree(d_hash_scalars);
+        return -1;
+    }
+
+    // Step 5: Fixed-point multiply: hash × G using precomputed table
+    FixedPointMultiplyKernel<<<num_blocks, threads_per_block>>>(
+        count, d_hash_scalars, d_fpm_results
+    );
+
+    err = cudaDeviceSynchronize();
+    if (err != cudaSuccess) {
+        printf("FixedPointMultiplyKernel error: %s\n", cudaGetErrorString(err));
+        cudaFree(d_hash_scalars);
+        cudaFree(d_fpm_results);
+        return -1;
+    }
+
+    cudaFree(d_hash_scalars);  // No longer needed
+
+    // Step 6: Extract X coordinates from fixed-point multiply results
+    // Results are in affine format stored by FixedPointMultiplyKernel
     constexpr u32 field_limbs = 8;  // 8 u32 limbs for 256-bit field
 
     uint32_t *result_x_coords;
     err = cudaMallocManaged(&result_x_coords, count * field_limbs * sizeof(uint32_t));
     if (err != cudaSuccess) {
         printf("cudaMallocManaged for result_x_coords error: %s\n", cudaGetErrorString(err));
+        cudaFree(d_fpm_results);
         return -1;
     }
 
-    // Extract X coordinates from column-major format (when GECC_QAPW_OPT_COLUMN_MAJORED_INPUTS is defined)
-    // With store_arbitrary: X limb j of point i is at R0[j * count + i]
-    for (u32 i = 0; i < count; i++) {
-        for (u32 j = 0; j < field_limbs; j++) {
-            result_x_coords[i * field_limbs + j] = solver->R0[j * count + i];
+    // Extract X coordinates from affine results (column-major format)
+    // FixedPointMultiplyKernel stores: X at [j * count + i], Y at [field_limbs * count + j * count + i]
+    #ifdef GECC_QAPW_OPT_COLUMN_MAJORED_INPUTS
+        for (u32 i = 0; i < count; i++) {
+            for (u32 j = 0; j < field_limbs; j++) {
+                result_x_coords[i * field_limbs + j] = d_fpm_results[j * count + i];
+            }
         }
-    }
+    #else
+        for (u32 i = 0; i < count; i++) {
+            for (u32 j = 0; j < field_limbs; j++) {
+                result_x_coords[i * field_limbs + j] = d_fpm_results[i * ECPoint::Affine::LIMBS + j];
+            }
+        }
+    #endif
 
-    cudaDeviceSynchronize();
+    cudaFree(d_fpm_results);  // No longer needed
 
-    // Now check matches
-    int threads_per_block = 256;
-    int num_blocks = (count + threads_per_block - 1) / threads_per_block;
-
+    // Step 7: Check matches against expected outputs
     CheckMatchesKernel<<<num_blocks, threads_per_block>>>(
         result_x_coords,  // Extracted X coordinates (in Montgomery form)
         state->d_outputs, state->d_output_offsets, state->d_output_lengths,
