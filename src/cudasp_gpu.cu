@@ -138,15 +138,8 @@ __global__ void CheckMatchesWithLabelsKernel(
         Field labeled_x_normal = AddPointsAndGetX(output_x_mont, output_y_mont, label_x, label_y);
         int64_t labeled_value = ExtractUpper64(labeled_x_normal);
 
-        // Check positive value
+        // Check value
         if (CheckValueMatch(labeled_value, outputs, offset, length)) {
-            match_flags[instance] = 1;
-            return;
-        }
-
-        // Check negated value
-        int64_t labeled_value_neg = -labeled_value;
-        if (CheckValueMatch(labeled_value_neg, outputs, offset, length)) {
             match_flags[instance] = 1;
             return;
         }
