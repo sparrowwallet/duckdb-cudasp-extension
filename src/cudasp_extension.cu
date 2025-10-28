@@ -384,9 +384,9 @@ static bool ShouldProcessBatch(const CudaspScanLocalState &local_state, const Cu
 
 static unique_ptr<FunctionData> CudaspScanBind(ClientContext &context, TableFunctionBindInput &input,
                                                       vector<LogicalType> &return_types, vector<string> &names) {
-	// Validate input: expects TABLE, scan_private_key BLOB, spend_public_key BLOB, label_keys LIST, and optional batch_size INTEGER
-	if (input.inputs.size() != 4 && input.inputs.size() != 5) {
-		throw InvalidInputException("cudasp_scan requires 4 or 5 arguments: TABLE, scan_private_key BLOB, spend_public_key BLOB, label_keys LIST[BLOB], and optional batch_size INTEGER");
+	// Validate input: expects TABLE, scan_private_key BLOB, spend_public_key BLOB, label_keys LIST
+	if (input.inputs.size() != 4) {
+		throw InvalidInputException("cudasp_scan requires 4 arguments: TABLE, scan_private_key BLOB, spend_public_key BLOB, and label_keys LIST[BLOB]");
 	}
 
 	// Validate scan_private_key parameter
@@ -434,13 +434,14 @@ static unique_ptr<FunctionData> CudaspScanBind(ClientContext &context, TableFunc
 		label_keys.push_back(std::string(label_key.GetData(), label_key.GetSize()));
 	}
 
-	// Parse optional batch_size parameter (default: 10000)
+	// Parse optional batch_size named parameter (default: 10000)
 	idx_t batch_size = 10000;
-	if (input.inputs.size() == 5) {
-		auto &batch_size_value = input.inputs[4];
+	auto batch_size_entry = input.named_parameters.find("batch_size");
+	if (batch_size_entry != input.named_parameters.end()) {
+		auto &batch_size_value = batch_size_entry->second;
 		if (batch_size_value.type().id() != LogicalTypeId::INTEGER &&
 		    batch_size_value.type().id() != LogicalTypeId::BIGINT) {
-			throw InvalidInputException("Fifth argument (batch_size) must be an INTEGER");
+			throw InvalidInputException("batch_size parameter must be an INTEGER");
 		}
 		int64_t batch_size_int = IntegerValue::Get(batch_size_value);
 		if (batch_size_int <= 0) {
@@ -646,21 +647,14 @@ static OperatorFinalizeResultType CudaspScanFinalFunction(ExecutionContext &cont
 }
 
 static void LoadInternal(ExtensionLoader &loader) {
-	TableFunctionSet cudasp_scan("cudasp_scan");
+	TableFunction func("cudasp_scan", {LogicalType::TABLE, LogicalType::BLOB, LogicalType::BLOB, LogicalType::LIST(LogicalType::BLOB)}, nullptr, CudaspScanBind, CudaspScanInit, CudaspScanLocalInit);
+	func.in_out_function = CudaspScanFunction;
+	func.in_out_function_final = CudaspScanFinalFunction;
 
-	// Function with 4 parameters (default batch_size)
-	TableFunction func4({LogicalType::TABLE, LogicalType::BLOB, LogicalType::BLOB, LogicalType::LIST(LogicalType::BLOB)}, nullptr, CudaspScanBind, CudaspScanInit, CudaspScanLocalInit);
-	func4.in_out_function = CudaspScanFunction;
-	func4.in_out_function_final = CudaspScanFinalFunction;
-	cudasp_scan.AddFunction(func4);
+	// Add optional batch_size parameter
+	func.named_parameters["batch_size"] = LogicalType::INTEGER;
 
-	// Function with 5 parameters (custom batch_size)
-	TableFunction func5({LogicalType::TABLE, LogicalType::BLOB, LogicalType::BLOB, LogicalType::LIST(LogicalType::BLOB), LogicalType::INTEGER}, nullptr, CudaspScanBind, CudaspScanInit, CudaspScanLocalInit);
-	func5.in_out_function = CudaspScanFunction;
-	func5.in_out_function_final = CudaspScanFinalFunction;
-	cudasp_scan.AddFunction(func5);
-
-	loader.RegisterFunction(cudasp_scan);
+	loader.RegisterFunction(func);
 }
 
 void CudaspExtension::Load(ExtensionLoader &loader) {
