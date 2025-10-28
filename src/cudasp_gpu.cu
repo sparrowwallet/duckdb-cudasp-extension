@@ -497,6 +497,9 @@ extern "C" void* LaunchBatchScan(
         return nullptr;
     }
 
+    // Initialize match_flags to 0
+    memset(*managed_match_flags, 0, count * sizeof(uint8_t));
+
     // Allocate device memory for spend public key (8 u32 limbs each for x and y)
     constexpr u32 field_limbs = 8;
     err = cudaMallocManaged(&state->d_spend_pubkey_x, field_limbs * sizeof(uint32_t));
