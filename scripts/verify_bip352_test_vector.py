@@ -1,13 +1,6 @@
 #!/usr/bin/env python3
 """
-Compute expected lower 64 bits for BIP-352 Silent Payment pipeline.
-
-Pipeline:
-1. First EC multiply: tweak_key * scan_private_key → shared_secret
-2. Serialize shared_secret to compressed SEC1 (33 bytes) + 4 zero bytes
-3. Compute tagged hash: SHA256(SHA256(tag) || SHA256(tag) || serialized)
-4. Second EC multiply: hash × G → output_point
-5. Extract lower 64 bits of output_point.x
+Verify BIP-352 test vector by computing the complete pipeline step by step.
 """
 
 import hashlib
@@ -92,19 +85,69 @@ def tagged_hash(tag, msg):
     tag_hash = hashlib.sha256(tag).digest()
     return hashlib.sha256(tag_hash + tag_hash + msg).digest()
 
-# Test case 0 from gECC correctness test
-print("=== BIP-352 Silent Payment Expected Value Calculation ===\n")
+# BIP-352 test vector inputs
+print("=== BIP-352 Test Vector Verification ===\n")
 
-# Input: scalar and tweak key from test
-scan_private_key = 0x0278927476e92caa3912937a7f003e45c741ddc47d80d70ae8f35c0c7f3c78fd
-tweak_x = 0xef8ef523cd9e1a96dc497886b69cfc28474207c5679252541288869af65ee7f9
-tweak_y = 0xf59a57a32f25c0b0963dc44e5a268c1e258a118cfaecda3dadd2394b3e4bacc8
+scan_private_key_hex = "0f694e068028a717f8af6b9411f9a133dd3565258714cc226594b34db90c1f2c"
+spend_public_key_hex = "36cf8fcd4d4890ab6c1083aeb5b50c260c20acda7839120e3575836f6d85c95ce0d705e31ff9fdcce67a8f3598871c6dfbe6bcde8a51cb7b48b0f95be0ea94de"
+# tweak_key from decompressed point (little-endian x||y, 64 bytes)
+tweak_key_hex = "040096db612390ee6cef521e784c897c446a26cea8e28819962e5316c253c24a501e53f71071162afab559954064f0ccb7a6779c23b305597b6335829cc1f5b7"
+expected_output = 4512552348537027144
 
-print(f"Inputs:")
-print(f"  scan_private_key = {scan_private_key:064x}")
-print(f"  tweak_key.x = {tweak_x:064x}")
-print(f"  tweak_key.y = {tweak_y:064x}")
+print("Inputs (as provided):")
+print(f"  scan_private_key (big-endian): {scan_private_key_hex}")
+print(f"  spend_public_key (little-endian x||y): {spend_public_key_hex}")
+print(f"  tweak_key (little-endian x||y, 64 bytes): {tweak_key_hex}")
+print(f"  expected_output: {expected_output}")
 print()
+
+# Parse scan_private_key (big-endian scalar)
+scan_private_key = int.from_bytes(bytes.fromhex(scan_private_key_hex), 'big')
+print(f"Parsed scan_private_key (scalar): {scan_private_key:064x}")
+print()
+
+# Parse spend_public_key (little-endian x||y, 64 bytes total)
+spend_pubkey_bytes = bytes.fromhex(spend_public_key_hex)
+spend_x_le = spend_pubkey_bytes[:32]
+spend_y_le = spend_pubkey_bytes[32:]
+spend_x = int.from_bytes(spend_x_le, 'little')
+spend_y = int.from_bytes(spend_y_le, 'little')
+print(f"Parsed spend_public_key:")
+print(f"  x (from little-endian): {spend_x:064x}")
+print(f"  y (from little-endian): {spend_y:064x}")
+print()
+
+# Parse tweak_key (little-endian x||y, 64 bytes total)
+tweak_key_bytes = bytes.fromhex(tweak_key_hex)
+tweak_x_le = tweak_key_bytes[:32]
+tweak_y_le = tweak_key_bytes[32:]
+tweak_x = int.from_bytes(tweak_x_le, 'little')
+tweak_y = int.from_bytes(tweak_y_le, 'little')
+print(f"Parsed tweak_key (little-endian x||y):")
+print(f"  x (from little-endian): {tweak_x:064x}")
+print(f"  y (from little-endian): {tweak_y:064x}")
+print()
+
+# Verify points are on the curve: y^2 = x^3 + 7 (mod p)
+def verify_point(x, y, name):
+    lhs = (y * y) % p
+    rhs = (x * x * x + 7) % p
+    if lhs == rhs:
+        print(f"✓ {name} is on the curve")
+        return True
+    else:
+        print(f"✗ {name} is NOT on the curve!")
+        print(f"  y^2 mod p = {lhs:064x}")
+        print(f"  x^3 + 7 mod p = {rhs:064x}")
+        return False
+
+print("Point verification:")
+verify_point(spend_x, spend_y, "spend_public_key")
+verify_point(tweak_x, tweak_y, "tweak_key")
+print()
+
+# Pipeline
+print("=== BIP-352 Pipeline ===\n")
 
 # Step 1: First EC multiply - tweak_key * scan_private_key
 print("Step 1: First EC multiply (tweak_key * scan_private_key)")
@@ -140,13 +183,8 @@ print(f"  output_point.y = {output_point[1]:064x}")
 print()
 
 # Step 5: Add spend_public_key to output_point
-print("Step 5: Add spend_public_key (using G for test)")
-# For testing, use generator point G as spend_public_key
-spend_public_key = (Gx, Gy)
-print(f"  spend_public_key.x = {spend_public_key[0]:064x}")
-print(f"  spend_public_key.y = {spend_public_key[1]:064x}")
-
-final_point = point_add(output_point, spend_public_key)
+print("Step 5: Add spend_public_key to output_point")
+final_point = point_add(output_point, (spend_x, spend_y))
 print(f"  final_point.x = {final_point[0]:064x}")
 print(f"  final_point.y = {final_point[1]:064x}")
 print()
@@ -155,22 +193,18 @@ print()
 print("Step 6: Extract 64-bit values from final_point.x")
 print(f"  Full x-coordinate: {final_point[0]:064x}")
 
+# Lower 64 bits (least significant)
 lower_64_bits = final_point[0] & 0xFFFFFFFFFFFFFFFF
-upper_64_bits = (final_point[0] >> 192) & 0xFFFFFFFFFFFFFFFF
-
 print(f"  Lower 64 bits (hex): {lower_64_bits:016x}")
 print(f"  Lower 64 bits (unsigned): {lower_64_bits}")
+
+# Upper 64 bits (most significant)
+upper_64_bits = (final_point[0] >> 192) & 0xFFFFFFFFFFFFFFFF
 print(f"  Upper 64 bits (hex): {upper_64_bits:016x}")
 print(f"  Upper 64 bits (unsigned): {upper_64_bits}")
 print()
 
-print("=== Expected value for test (using UPPER 64 bits per BIP-352) ===")
-print(f"Row 0 expected output: {upper_64_bits}")
-print()
-print("=== Spend public key (64 bytes, little-endian x||y) ===")
-# Convert to little-endian bytes for BLOB
-spend_x_bytes = spend_public_key[0].to_bytes(32, 'little')
-spend_y_bytes = spend_public_key[1].to_bytes(32, 'little')
-spend_pubkey_blob = spend_x_bytes + spend_y_bytes
-print(f"BLOB '\\x{spend_pubkey_blob.hex()}'")
-print(f"  (formatted: {' '.join(f'\\x{b:02x}' for b in spend_pubkey_blob)})")
+print("=== Comparison ===")
+print(f"Expected output: {expected_output} (hex: {expected_output:016x})")
+print(f"Computed lower 64 bits: {lower_64_bits} → Match: {'✓ YES' if lower_64_bits == expected_output else '✗ NO'}")
+print(f"Computed upper 64 bits: {upper_64_bits} → Match: {'✓ YES' if upper_64_bits == expected_output else '✗ NO'}")

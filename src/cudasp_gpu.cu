@@ -52,15 +52,18 @@ __global__ void CheckMatchesKernel(
 
     Field x_normal = x_mont.from_montgomery();
 
-    // Extract lower 64 bits (first 2 u32 limbs in little-endian)
-    uint64_t computed_value_u64 = static_cast<uint64_t>(x_normal.digits[0]) |
-                                  (static_cast<uint64_t>(x_normal.digits[1]) << 32);
+    // Extract upper 64 bits (last 2 u32 limbs in little-endian storage = most significant bits)
+    // For 256-bit field with 8 u32 limbs: digits[6] and digits[7] are the most significant
+    uint64_t computed_value_u64 = static_cast<uint64_t>(x_normal.digits[6]) |
+                                  (static_cast<uint64_t>(x_normal.digits[7]) << 32);
     int64_t computed_value = static_cast<int64_t>(computed_value_u64);
+
+    // Get output list metadata
+    uint32_t offset = output_offsets[instance];
+    uint32_t length = output_lengths[instance];
 
     // Check if computed_value is in the outputs list for this row
     bool found = false;
-    uint32_t offset = output_offsets[instance];
-    uint32_t length = output_lengths[instance];
 
     for (uint32_t j = 0; j < length; ++j) {
         if (outputs[offset + j] == computed_value) {
