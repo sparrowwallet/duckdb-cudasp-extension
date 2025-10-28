@@ -80,73 +80,99 @@ __global__ void CheckMatchesWithLabelsKernel(
     const uint32_t *output_offsets,      // Offset into outputs for each row
     const uint32_t *output_lengths,      // Length of outputs list for each row
     uint8_t *match_flags,                // Output: 1 if match found, 0 otherwise
-    uint32_t count) {                    // Number of points to process
-
-    const u32 instance = blockIdx.x * blockDim.x + threadIdx.x;
-    if (instance >= count) return;
+    uint32_t count,                      // Number of points to process
+    uint64_t batch_id) {                 // Batch ID for debugging
 
     constexpr u32 field_limbs = 8;
 
-    // Load FPM result (output_point in Montgomery form, column-major)
-    Field output_x_mont, output_y_mont;
-    #ifdef GECC_QAPW_OPT_COLUMN_MAJORED_INPUTS
+    // Grid-stride loop: each thread processes multiple elements
+    for (u32 instance = blockIdx.x * blockDim.x + threadIdx.x;
+         instance < count;
+         instance += gridDim.x * blockDim.x) {
+
+        // Load FPM result (output_point in Montgomery form, column-major)
+        Field output_x_mont, output_y_mont;
+        #ifdef GECC_QAPW_OPT_COLUMN_MAJORED_INPUTS
+            for (u32 j = 0; j < field_limbs; j++) {
+                output_x_mont.digits[j] = fpm_results[j * count + instance];
+                output_y_mont.digits[j] = fpm_results[(field_limbs + j) * count + instance];
+            }
+        #else
+            for (u32 j = 0; j < field_limbs; j++) {
+                output_x_mont.digits[j] = fpm_results[instance * ECPoint::Affine::LIMBS + j];
+                output_y_mont.digits[j] = fpm_results[instance * ECPoint::Affine::LIMBS + field_limbs + j];
+            }
+        #endif
+
+        // Load spend_public_key and convert to Montgomery form
+        Field spend_x, spend_y;
         for (u32 j = 0; j < field_limbs; j++) {
-            output_x_mont.digits[j] = fpm_results[j * count + instance];
-            output_y_mont.digits[j] = fpm_results[(field_limbs + j) * count + instance];
+            spend_x.digits[j] = spend_pubkey_x[j];
+            spend_y.digits[j] = spend_pubkey_y[j];
         }
-    #else
-        for (u32 j = 0; j < field_limbs; j++) {
-            output_x_mont.digits[j] = fpm_results[instance * ECPoint::Affine::LIMBS + j];
-            output_y_mont.digits[j] = fpm_results[instance * ECPoint::Affine::LIMBS + field_limbs + j];
+        spend_x.inplace_to_montgomery();
+        spend_y.inplace_to_montgomery();
+
+        // Get output list metadata
+        uint32_t offset = output_offsets[instance];
+        uint32_t length = output_lengths[instance];
+
+        bool found_match = false;
+
+        // Base case: output_point + spend_public_key
+        Field final_x_normal = AddPointsAndGetX(output_x_mont, output_y_mont, spend_x, spend_y);
+
+        int64_t base_value = ExtractUpper64(final_x_normal);
+
+        if (CheckValueMatch(base_value, outputs, offset, length)) {
+            found_match = true;
         }
-    #endif
 
-    // Load spend_public_key and convert to Montgomery form
-    Field spend_x, spend_y;
-    for (u32 j = 0; j < field_limbs; j++) {
-        spend_x.digits[j] = spend_pubkey_x[j];
-        spend_y.digits[j] = spend_pubkey_y[j];
-    }
-    spend_x.inplace_to_montgomery();
-    spend_y.inplace_to_montgomery();
+        // Try each label key if no match yet
+        if (!found_match) {
+            // For label checking, we need final_point (output_point + spend_public_key) in Montgomery form
+            // Recompute the full point addition to get both X and Y coordinates
+            typename ECPoint::Affine output_affine;
+            output_affine.x = output_x_mont;
+            output_affine.y = output_y_mont;
 
-    // Get output list metadata
-    uint32_t offset = output_offsets[instance];
-    uint32_t length = output_lengths[instance];
+            typename ECPoint::Affine spend_affine;
+            spend_affine.x = spend_x;
+            spend_affine.y = spend_y;
 
-    // Base case: output_point + spend_public_key
-    Field final_x_normal = AddPointsAndGetX(output_x_mont, output_y_mont, spend_x, spend_y);
-    int64_t base_value = ExtractUpper64(final_x_normal);
+            ECPoint output_jac = output_affine.to_nonzero_jacobian();
+            ECPoint final_jac = output_jac + spend_affine;
+            typename ECPoint::Affine final_affine = final_jac.to_affine();
 
-    if (CheckValueMatch(base_value, outputs, offset, length)) {
-        match_flags[instance] = 1;
-        return;
-    }
+            // final_affine.x and final_affine.y are already in Montgomery form
+            Field final_x_mont = final_affine.x;
+            Field final_y_mont = final_affine.y;
 
-    // Try each label key
-    for (uint32_t label_idx = 0; label_idx < label_count; label_idx++) {
-        // Load label key and convert to Montgomery form
-        Field label_x, label_y;
-        for (u32 j = 0; j < field_limbs; j++) {
-            label_x.digits[j] = label_keys_x[label_idx * field_limbs + j];
-            label_y.digits[j] = label_keys_y[label_idx * field_limbs + j];
+            for (uint32_t label_idx = 0; label_idx < label_count; label_idx++) {
+                // Load label key and convert to Montgomery form
+                Field label_x, label_y;
+                for (u32 j = 0; j < field_limbs; j++) {
+                    label_x.digits[j] = label_keys_x[label_idx * field_limbs + j];
+                    label_y.digits[j] = label_keys_y[label_idx * field_limbs + j];
+                }
+                label_x.inplace_to_montgomery();
+                label_y.inplace_to_montgomery();
+
+                // Compute: final_point + label_key (NOT output_point + label_key!)
+                Field labeled_x_normal = AddPointsAndGetX(final_x_mont, final_y_mont, label_x, label_y);
+                int64_t labeled_value = ExtractUpper64(labeled_x_normal);
+
+                // Check value
+                if (CheckValueMatch(labeled_value, outputs, offset, length)) {
+                    found_match = true;
+                    break;  // Exit label loop
+                }
+            }
         }
-        label_x.inplace_to_montgomery();
-        label_y.inplace_to_montgomery();
 
-        // Compute: output_point + label_key
-        Field labeled_x_normal = AddPointsAndGetX(output_x_mont, output_y_mont, label_x, label_y);
-        int64_t labeled_value = ExtractUpper64(labeled_x_normal);
-
-        // Check value
-        if (CheckValueMatch(labeled_value, outputs, offset, length)) {
-            match_flags[instance] = 1;
-            return;
-        }
-    }
-
-    // No match found
-    match_flags[instance] = 0;
+        // Set match flag
+        match_flags[instance] = found_match ? 1 : 0;
+    }  // end grid-stride loop
 }
 
 // Kernel to check computed results against outputs and set match flags
@@ -208,47 +234,51 @@ __global__ void CheckMatchesKernel(
 __global__ void SerializeToCompressedSEC1Kernel(
     const uint32_t *R0,             // Input: EC points in column-major format
     uint8_t *serialized,            // Output: serialized points (37 bytes each)
-    uint32_t count) {               // Number of points
-
-    const u32 instance = blockIdx.x * blockDim.x + threadIdx.x;
-    if (instance >= count) return;
+    uint32_t count,                 // Number of points
+    uint64_t batch_id) {            // Batch ID for debugging
 
     constexpr u32 field_limbs = 8;  // 8 u32 limbs for 256-bit field
 
-    // Load X and Y coordinates from column-major R0 (in Montgomery form)
-    Field x_mont, y_mont;
-    for (u32 j = 0; j < field_limbs; ++j) {
-        x_mont.digits[j] = R0[j * count + instance];                    // X coord
-        y_mont.digits[j] = R0[(field_limbs + j) * count + instance];    // Y coord
-    }
+    // Grid-stride loop: each thread processes multiple elements
+    for (u32 instance = blockIdx.x * blockDim.x + threadIdx.x;
+         instance < count;
+         instance += gridDim.x * blockDim.x) {
 
-    // Convert from Montgomery form to normal form
-    Field x_normal = x_mont.from_montgomery();
-    Field y_normal = y_mont.from_montgomery();
+        // Load X and Y coordinates from column-major R0 (in Montgomery form)
+        Field x_mont, y_mont;
+        for (u32 j = 0; j < field_limbs; ++j) {
+            x_mont.digits[j] = R0[j * count + instance];                    // X coord
+            y_mont.digits[j] = R0[(field_limbs + j) * count + instance];    // Y coord
+        }
 
-    // Compute Y parity (even = 0x02, odd = 0x03)
-    uint8_t prefix = 0x02 + (y_normal.digits[0] & 1);
+        // Convert from Montgomery form to normal form
+        Field x_normal = x_mont.from_montgomery();
+        Field y_normal = y_mont.from_montgomery();
 
-    // Output pointer for this point (37 bytes)
-    uint8_t *output = serialized + instance * 37;
+        // Compute Y parity (even = 0x02, odd = 0x03)
+        uint8_t prefix = 0x02 + (y_normal.digits[0] & 1);
 
-    // Write prefix
-    output[0] = prefix;
+        // Output pointer for this point (37 bytes)
+        uint8_t *output = serialized + instance * 37;
 
-    // Write X coordinate (32 bytes, little-endian limbs to big-endian bytes)
-    for (u32 i = 0; i < 8; ++i) {
-        uint32_t limb = x_normal.digits[7 - i];  // Reverse limb order for big-endian
-        output[1 + i * 4 + 0] = (limb >> 24) & 0xFF;
-        output[1 + i * 4 + 1] = (limb >> 16) & 0xFF;
-        output[1 + i * 4 + 2] = (limb >> 8) & 0xFF;
-        output[1 + i * 4 + 3] = (limb >> 0) & 0xFF;
-    }
+        // Write prefix
+        output[0] = prefix;
 
-    // Append 4 zero bytes
-    output[33] = 0x00;
-    output[34] = 0x00;
-    output[35] = 0x00;
-    output[36] = 0x00;
+        // Write X coordinate (32 bytes, little-endian limbs to big-endian bytes)
+        for (u32 i = 0; i < 8; ++i) {
+            uint32_t limb = x_normal.digits[7 - i];  // Reverse limb order for big-endian
+            output[1 + i * 4 + 0] = (limb >> 24) & 0xFF;
+            output[1 + i * 4 + 1] = (limb >> 16) & 0xFF;
+            output[1 + i * 4 + 2] = (limb >> 8) & 0xFF;
+            output[1 + i * 4 + 3] = (limb >> 0) & 0xFF;
+        }
+
+        // Append 4 zero bytes
+        output[33] = 0x00;
+        output[34] = 0x00;
+        output[35] = 0x00;
+        output[36] = 0x00;
+    }  // end grid-stride loop
 }
 
 // Kernel to compute BIP0352 tagged hashes on serialized EC points
@@ -256,25 +286,29 @@ __global__ void SerializeToCompressedSEC1Kernel(
 __global__ void ComputeTaggedHashesKernel(
     const uint8_t *serialized,      // Input: serialized points (37 bytes each)
     uint8_t *hashes,                // Output: SHA256 hashes (32 bytes each)
-    uint32_t count) {               // Number of points
-
-    const u32 instance = blockIdx.x * blockDim.x + threadIdx.x;
-    if (instance >= count) return;
+    uint32_t count,                 // Number of points
+    uint64_t batch_id) {            // Batch ID for debugging
 
     // Tag for BIP-352 Silent Payments
     const char tag_str[] = "BIP0352/SharedSecret";
     const uint8_t *tag = reinterpret_cast<const uint8_t*>(tag_str);
-    const uint64_t tag_len = 20;  // Length of "BIP0352/SharedSecret" (B-I-P-0-3-5-2-/-S-h-a-r-e-d-S-e-c-r-e-t = 20 chars)
+    const uint64_t tag_len = 20;  // Length of "BIP0352/SharedSecret"
 
-    // Input message: 37 bytes (33-byte compressed point + 4 zero bytes)
-    const uint8_t *msg = serialized + instance * 37;
-    const uint64_t msg_len = 37;
+    // Grid-stride loop: each thread processes multiple elements
+    for (u32 instance = blockIdx.x * blockDim.x + threadIdx.x;
+         instance < count;
+         instance += gridDim.x * blockDim.x) {
 
-    // Output hash
-    uint8_t *hash = hashes + instance * 32;
+        // Input message: 37 bytes (33-byte compressed point + 4 zero bytes)
+        const uint8_t *msg = serialized + instance * 37;
+        const uint64_t msg_len = 37;
 
-    // Compute tagged hash
-    tagged_hash(tag, tag_len, msg, msg_len, hash);
+        // Output hash
+        uint8_t *hash = hashes + instance * 32;
+
+        // Compute tagged hash
+        tagged_hash(tag, tag_len, msg, msg_len, hash);
+    }
 }
 
 // Kernel for fixed-point multiplication: Computes hash × G for each hash
@@ -282,35 +316,39 @@ __global__ void ComputeTaggedHashesKernel(
 __global__ void FixedPointMultiplyKernel(
     u32 count,
     Order::Base *scalars,           // Input: scalar values (hashes converted to scalars)
-    ECPoint::Base *results) {       // Output: EC points (affine coordinates)
+    ECPoint::Base *results,         // Output: EC points (affine coordinates)
+    uint64_t batch_id) {            // Batch ID for debugging
 
-    u32 instance = blockIdx.x * blockDim.x + threadIdx.x;
-    if (instance >= count) return;
+    // Grid-stride loop: each thread processes multiple elements
+    for (u32 instance = blockIdx.x * blockDim.x + threadIdx.x;
+         instance < count;
+         instance += gridDim.x * blockDim.x) {
 
-    // Load scalar
-    Order s;
-    #ifdef GECC_QAPW_OPT_COLUMN_MAJORED_INPUTS
-        s.load_arbitrary(scalars, count, instance, 0);
-    #else
-        s.load(scalars + instance * Order::LIMBS, 0, 0, 0);
-    #endif
+        // Load scalar
+        Order s;
+        #ifdef GECC_QAPW_OPT_COLUMN_MAJORED_INPUTS
+            s.load_arbitrary(scalars, count, instance, 0);
+        #else
+            s.load(scalars + instance * Order::LIMBS, 0, 0, 0);
+        #endif
 
-    // Compute s × G using fixed-point multiplication
-    // This reads from precomputed table in device constant memory
-    ECPoint p = ECPoint::zero();
-    Solver::fixed_point_mult(p, s, true);
+        // Compute s × G using fixed-point multiplication
+        // This reads from precomputed table in device constant memory
+        ECPoint p = ECPoint::zero();
+        Solver::fixed_point_mult(p, s, true);
 
-    // Convert Jacobian to affine coordinates
-    typename ECPoint::Affine result = p.to_affine();
+        // Convert Jacobian to affine coordinates
+        typename ECPoint::Affine result = p.to_affine();
 
-    // Store result
-    #ifdef GECC_QAPW_OPT_COLUMN_MAJORED_INPUTS
-        result.x.store_arbitrary(results, count, instance, 0);
-        result.y.store_arbitrary(results + count * Field::LIMBS, count, instance, 0);
-    #else
-        result.x.store(results + instance * ECPoint::Affine::LIMBS, 0, 0, 0);
-        result.y.store(results + instance * ECPoint::Affine::LIMBS + Field::LIMBS, 0, 0, 0);
-    #endif
+        // Store result
+        #ifdef GECC_QAPW_OPT_COLUMN_MAJORED_INPUTS
+            result.x.store_arbitrary(results, count, instance, 0);
+            result.y.store_arbitrary(results + count * Field::LIMBS, count, instance, 0);
+        #else
+            result.x.store(results + instance * ECPoint::Affine::LIMBS, 0, 0, 0);
+            result.y.store(results + instance * ECPoint::Affine::LIMBS + Field::LIMBS, 0, 0, 0);
+        #endif
+    }
 }
 
 // Kernel for EC point addition: Adds spend_public_key to each output point
@@ -394,10 +432,11 @@ struct BatchScanState {
     uint32_t label_count;        // Number of label keys
     Solver *solver;              // ECDSA solver instance
     uint32_t count;
+    uint64_t batch_id;           // Unique batch identifier for debugging
 };
 
 // Host function to initialize solver and prepare for EC multiplication
-// This follows the pattern from gECC's ec_pmul_random_init, but with our specific data
+// This follows the pattern from gECC's ec_pmul_init, but with our specific data
 // Returns an opaque handle to BatchScanState (cast to void*) for thread-safe operation
 extern "C" void* LaunchBatchScan(
     uint32_t **managed_points_x,      // Will allocate managed memory for input points
@@ -416,11 +455,11 @@ extern "C" void* LaunchBatchScan(
     size_t outputs_size) {
 
     // Initialize field and solver once per program (not per batch)
-    static bool initialized = false;
-    if (!initialized) {
+    // Use C++11 static initialization guarantee for thread safety
+    static bool initialized = []() {
         Solver::initialize();
-        initialized = true;
-    }
+        return true;
+    }();
 
     // Allocate per-batch state (thread-safe)
     BatchScanState *state = new BatchScanState();
@@ -435,6 +474,9 @@ extern "C" void* LaunchBatchScan(
     state->label_count = label_count;
     state->solver = nullptr;
     state->count = count;
+
+    // Generate unique batch ID for debugging (use pointer address as unique ID)
+    state->batch_id = reinterpret_cast<uint64_t>(state);
 
     // Allocate managed memory for point coordinates (caller will fill these)
     cudaError_t err;
@@ -451,8 +493,10 @@ extern "C" void* LaunchBatchScan(
         return nullptr;
     }
 
-    // Allocate outputs metadata
-    err = cudaMallocManaged(&state->d_outputs, outputs_size * sizeof(int64_t));
+    // Allocate outputs metadata as DEVICE memory (not unified)
+    // CRITICAL: Use cudaMalloc instead of cudaMallocManaged to avoid coherency issues
+    // in concurrent batch processing when combined with cudaMemcpyHostToDevice
+    err = cudaMalloc(&state->d_outputs, outputs_size * sizeof(int64_t));
     if (err != cudaSuccess) {
         cudaFree(*managed_points_x);
         cudaFree(*managed_points_y);
@@ -460,7 +504,7 @@ extern "C" void* LaunchBatchScan(
         return nullptr;
     }
 
-    err = cudaMallocManaged(&state->d_output_offsets, count * sizeof(uint32_t));
+    err = cudaMalloc(&state->d_output_offsets, count * sizeof(uint32_t));
     if (err != cudaSuccess) {
         cudaFree(*managed_points_x);
         cudaFree(*managed_points_y);
@@ -468,8 +512,10 @@ extern "C" void* LaunchBatchScan(
         delete state;
         return nullptr;
     }
+    // Zero out the memory to ensure no stale data
+    cudaMemset(state->d_output_offsets, 0, count * sizeof(uint32_t));
 
-    err = cudaMallocManaged(&state->d_output_lengths, count * sizeof(uint32_t));
+    err = cudaMalloc(&state->d_output_lengths, count * sizeof(uint32_t));
     if (err != cudaSuccess) {
         cudaFree(*managed_points_x);
         cudaFree(*managed_points_y);
@@ -478,6 +524,8 @@ extern "C" void* LaunchBatchScan(
         delete state;
         return nullptr;
     }
+    // Zero out the memory to ensure no stale data
+    cudaMemset(state->d_output_lengths, 0, count * sizeof(uint32_t));
 
     err = cudaMallocManaged(managed_match_flags, count * sizeof(uint8_t));
     if (err != cudaSuccess) {
@@ -495,7 +543,7 @@ extern "C" void* LaunchBatchScan(
 
     // Allocate device memory for spend public key (8 u32 limbs each for x and y)
     constexpr u32 field_limbs = 8;
-    err = cudaMallocManaged(&state->d_spend_pubkey_x, field_limbs * sizeof(uint32_t));
+    err = cudaMalloc(&state->d_spend_pubkey_x, field_limbs * sizeof(uint32_t));
     if (err != cudaSuccess) {
         cudaFree(*managed_points_x);
         cudaFree(*managed_points_y);
@@ -507,7 +555,7 @@ extern "C" void* LaunchBatchScan(
         return nullptr;
     }
 
-    err = cudaMallocManaged(&state->d_spend_pubkey_y, field_limbs * sizeof(uint32_t));
+    err = cudaMalloc(&state->d_spend_pubkey_y, field_limbs * sizeof(uint32_t));
     if (err != cudaSuccess) {
         cudaFree(*managed_points_x);
         cudaFree(*managed_points_y);
@@ -520,18 +568,35 @@ extern "C" void* LaunchBatchScan(
         return nullptr;
     }
 
-    // Copy outputs metadata
-    memcpy(state->d_outputs, h_outputs, outputs_size * sizeof(int64_t));
-    memcpy(state->d_output_offsets, h_output_offsets, count * sizeof(uint32_t));
-    memcpy(state->d_output_lengths, h_output_lengths, count * sizeof(uint32_t));
+    // Copy outputs metadata using cudaMemcpy to ensure proper coherency
+    // CRITICAL: Use cudaMemcpy instead of memcpy for unified memory to ensure
+    // data is properly synchronized between host and device in concurrent execution
+    err = cudaMemcpy(state->d_outputs, h_outputs, outputs_size * sizeof(int64_t), cudaMemcpyHostToDevice);
+    if (err != cudaSuccess) {
+        printf("cudaMemcpy d_outputs error: %s\n", cudaGetErrorString(err));
+    }
+    err = cudaMemcpy(state->d_output_offsets, h_output_offsets, count * sizeof(uint32_t), cudaMemcpyHostToDevice);
+    if (err != cudaSuccess) {
+        printf("cudaMemcpy d_output_offsets error: %s\n", cudaGetErrorString(err));
+    }
+    err = cudaMemcpy(state->d_output_lengths, h_output_lengths, count * sizeof(uint32_t), cudaMemcpyHostToDevice);
+    if (err != cudaSuccess) {
+        printf("cudaMemcpy d_output_lengths error: %s\n", cudaGetErrorString(err));
+    }
+
+    // Synchronize to ensure all data is copied to device before returning
+    err = cudaDeviceSynchronize();
+    if (err != cudaSuccess) {
+        printf("cudaDeviceSynchronize after memcpy error: %s\n", cudaGetErrorString(err));
+    }
 
     // Copy spend public key
-    memcpy(state->d_spend_pubkey_x, h_spend_pubkey_x, field_limbs * sizeof(uint32_t));
-    memcpy(state->d_spend_pubkey_y, h_spend_pubkey_y, field_limbs * sizeof(uint32_t));
+    cudaMemcpy(state->d_spend_pubkey_x, h_spend_pubkey_x, field_limbs * sizeof(uint32_t), cudaMemcpyHostToDevice);
+    cudaMemcpy(state->d_spend_pubkey_y, h_spend_pubkey_y, field_limbs * sizeof(uint32_t), cudaMemcpyHostToDevice);
 
     // Allocate and copy label keys (if any)
     if (label_count > 0) {
-        err = cudaMallocManaged(&state->d_label_keys_x, label_count * field_limbs * sizeof(uint32_t));
+        err = cudaMalloc(&state->d_label_keys_x, label_count * field_limbs * sizeof(uint32_t));
         if (err != cudaSuccess) {
             cudaFree(*managed_points_x);
             cudaFree(*managed_points_y);
@@ -545,7 +610,7 @@ extern "C" void* LaunchBatchScan(
             return nullptr;
         }
 
-        err = cudaMallocManaged(&state->d_label_keys_y, label_count * field_limbs * sizeof(uint32_t));
+        err = cudaMalloc(&state->d_label_keys_y, label_count * field_limbs * sizeof(uint32_t));
         if (err != cudaSuccess) {
             cudaFree(*managed_points_x);
             cudaFree(*managed_points_y);
@@ -560,8 +625,8 @@ extern "C" void* LaunchBatchScan(
             return nullptr;
         }
 
-        memcpy(state->d_label_keys_x, h_label_keys_x, label_count * field_limbs * sizeof(uint32_t));
-        memcpy(state->d_label_keys_y, h_label_keys_y, label_count * field_limbs * sizeof(uint32_t));
+        cudaMemcpy(state->d_label_keys_x, h_label_keys_x, label_count * field_limbs * sizeof(uint32_t), cudaMemcpyHostToDevice);
+        cudaMemcpy(state->d_label_keys_y, h_label_keys_y, label_count * field_limbs * sizeof(uint32_t), cudaMemcpyHostToDevice);
     }
 
     // Create fresh solver for this batch
@@ -595,13 +660,13 @@ extern "C" int RunBatchScanKernels(
 
     cudaDeviceSynchronize();
 
-    // Prepare data in the format expected by ec_pmul_random_init
+    // Prepare data in the format expected by ec_pmul_init
     // MAX_LIMBS is defined in gECC as 64 (maximum array size)
     // For secp256k1 (256-bit), we use 4 u64 limbs, but arrays must be size MAX_LIMBS
     constexpr u32 MAX_LIMBS = 64;
     constexpr u32 USED_LIMBS = 4;  // 256 bits = 4 u64 limbs
 
-    // Allocate host arrays in the format ec_pmul_random_init expects
+    // Allocate host arrays in the format ec_pmul_init expects
     u64 (*h_scalars)[MAX_LIMBS] = new u64[count][MAX_LIMBS];
     u64 (*h_keys_x)[MAX_LIMBS] = new u64[count][MAX_LIMBS];
     u64 (*h_keys_y)[MAX_LIMBS] = new u64[count][MAX_LIMBS];
@@ -617,7 +682,7 @@ extern "C" int RunBatchScanKernels(
         // h_scalar array is in little-endian order: h_scalar[0] is LEAST significant u32
         // We need to pack sequentially: h_scalars[0] should be least significant u64
         //
-        // IMPORTANT: gECC's ec_pmul_random_init uses reinterpret_cast<Base*>(u64_array)
+        // IMPORTANT: gECC's ec_pmul_init uses reinterpret_cast<Base*>(u64_array)
         // which interprets each u64 as two u32s. We pack two sequential u32s into each u64.
         for (u32 j = 0; j < USED_LIMBS; j++) {
             // Pack two sequential u32s: low_u32 | (high_u32 << 32)
@@ -656,8 +721,8 @@ extern "C" int RunBatchScanKernels(
         }
     #endif
 
-    // Call ec_pmul_random_init with our specific data
-    solver->ec_pmul_random_init(h_scalars, h_keys_x, h_keys_y, count);
+    // Call ec_pmul_init with our specific data
+    solver->ec_pmul_init(h_scalars, h_keys_x, h_keys_y, count);
 
     // Free host arrays
     delete[] h_scalars;
@@ -667,19 +732,15 @@ extern "C" int RunBatchScanKernels(
     // Check for initialization errors
     cudaError_t err = cudaPeekAtLastError();
     if (err != cudaSuccess) {
-        printf("ec_pmul_random_init error: %s\n", cudaGetErrorString(err));
+        printf("ec_pmul_init error: %s\n", cudaGetErrorString(err));
         return -1;
     }
 
     // Run EC multiplication (matching ecdsa_ec_pmul call)
-    // Calculate block_num to ensure block_num * threads_per_block >= count
+    // Use MAX_SM_NUMS blocks (like gECC tests) to ensure proper work distribution
+    // The kernels use grid-stride loops, so they can handle any count with any block_num
     u32 max_thread_per_block = 256;
-    u32 block_num = (count + max_thread_per_block - 1) / max_thread_per_block;
-
-    // Ensure we use at least MAX_SM_NUMS blocks for efficiency (if count allows)
-    if (block_num < MAX_SM_NUMS && count >= MAX_SM_NUMS * max_thread_per_block) {
-        block_num = MAX_SM_NUMS;
-    }
+    u32 block_num = MAX_SM_NUMS;  // Use SM count like gECC test for optimal occupancy
 
     solver->ecdsa_ec_pmul(block_num, max_thread_per_block, true);  // true = unknown points
 
@@ -689,6 +750,8 @@ extern "C" int RunBatchScanKernels(
         printf("ecdsa_ec_pmul (first) error: %s\n", cudaGetErrorString(err));
         return -1;
     }
+
+    cudaDeviceSynchronize();
 
     // === BIP-352 Silent Payment Pipeline ===
     // Step 1: Serialize shared secrets to compressed SEC1 format + 4 zero bytes (37 bytes each)
@@ -700,10 +763,12 @@ extern "C" int RunBatchScanKernels(
     }
 
     int threads_per_block = 256;
-    int num_blocks = (count + threads_per_block - 1) / threads_per_block;
+    // Use fixed block count with grid-stride loops to handle any batch size
+    // Kernels will process multiple elements per thread when count > blocks * threads
+    int num_blocks = MAX_SM_NUMS;  // Use SM count for good occupancy
 
     SerializeToCompressedSEC1Kernel<<<num_blocks, threads_per_block>>>(
-        solver->R0, d_serialized, count
+        solver->R0, d_serialized, count, state->batch_id
     );
 
     err = cudaDeviceSynchronize();
@@ -723,7 +788,7 @@ extern "C" int RunBatchScanKernels(
     }
 
     ComputeTaggedHashesKernel<<<num_blocks, threads_per_block>>>(
-        d_serialized, d_hashes, count
+        d_serialized, d_hashes, count, state->batch_id
     );
 
     err = cudaDeviceSynchronize();
@@ -734,22 +799,29 @@ extern "C" int RunBatchScanKernels(
         return -1;
     }
 
+    // Debug: Log hash result
     cudaFree(d_serialized);  // No longer needed
 
     // Step 3: Convert hashes to Order scalars for fixed-point multiplication
-    Order::Base *d_hash_scalars;
-    err = cudaMallocManaged(&d_hash_scalars, Order::SIZE * count);
+    // Copy hashes to host memory first to avoid coherency issues
+    uint8_t *h_hashes = new uint8_t[count * 32];
+    err = cudaMemcpy(h_hashes, d_hashes, count * 32, cudaMemcpyDeviceToHost);
     if (err != cudaSuccess) {
-        printf("cudaMallocManaged for d_hash_scalars error: %s\n", cudaGetErrorString(err));
+        printf("cudaMemcpy for h_hashes error: %s\n", cudaGetErrorString(err));
         cudaFree(d_hashes);
         return -1;
     }
+
+    cudaFree(d_hashes);  // No longer needed
+
+    // Allocate host buffer for conversion
+    Order::Base *h_hash_scalars = new Order::Base[Order::SIZE * count];
 
     // Convert 32-byte hashes (big-endian) to Order::Base (u32) limbs in column-major format
     #ifdef GECC_QAPW_OPT_COLUMN_MAJORED_INPUTS
         // Column-major: limb j of scalar i is at [j * count + i]
         for (u32 i = 0; i < count; i++) {
-            uint8_t *hash = d_hashes + i * 32;
+            uint8_t *hash = h_hashes + i * 32;
             // Hash is big-endian: hash[0] is most significant byte
             // Convert to u32 limbs in little-endian order
             for (u32 j = 0; j < Order::LIMBS; j++) {
@@ -758,24 +830,43 @@ extern "C" int RunBatchScanKernels(
                                 (static_cast<uint32_t>(hash[31 - j * 4 - 1]) << 8) |
                                 (static_cast<uint32_t>(hash[31 - j * 4 - 2]) << 16) |
                                 (static_cast<uint32_t>(hash[31 - j * 4 - 3]) << 24);
-                d_hash_scalars[j * count + i] = limb;
+                h_hash_scalars[j * count + i] = limb;
             }
         }
     #else
         // Row-major: limb j of scalar i is at [i * Order::LIMBS + j]
         for (u32 i = 0; i < count; i++) {
-            uint8_t *hash = d_hashes + i * 32;
+            uint8_t *hash = h_hashes + i * 32;
             for (u32 j = 0; j < Order::LIMBS; j++) {
                 uint32_t limb = (static_cast<uint32_t>(hash[31 - j * 4 - 0]) << 0) |
                                 (static_cast<uint32_t>(hash[31 - j * 4 - 1]) << 8) |
                                 (static_cast<uint32_t>(hash[31 - j * 4 - 2]) << 16) |
                                 (static_cast<uint32_t>(hash[31 - j * 4 - 3]) << 24);
-                d_hash_scalars[i * Order::LIMBS + j] = limb;
+                h_hash_scalars[i * Order::LIMBS + j] = limb;
             }
         }
     #endif
 
-    cudaFree(d_hashes);  // No longer needed
+    delete[] h_hashes;  // No longer needed
+
+    // Allocate device memory and copy
+    Order::Base *d_hash_scalars;
+    err = cudaMalloc(&d_hash_scalars, Order::SIZE * count);
+    if (err != cudaSuccess) {
+        printf("cudaMalloc for d_hash_scalars error: %s\n", cudaGetErrorString(err));
+        delete[] h_hash_scalars;
+        return -1;
+    }
+
+    err = cudaMemcpy(d_hash_scalars, h_hash_scalars, Order::SIZE * count, cudaMemcpyHostToDevice);
+    if (err != cudaSuccess) {
+        printf("cudaMemcpy for d_hash_scalars error: %s\n", cudaGetErrorString(err));
+        delete[] h_hash_scalars;
+        cudaFree(d_hash_scalars);
+        return -1;
+    }
+
+    delete[] h_hash_scalars;  // No longer needed
 
     // Step 4: Allocate output buffer for fixed-point multiply results
     ECPoint::Base *d_fpm_results;
@@ -788,7 +879,7 @@ extern "C" int RunBatchScanKernels(
 
     // Step 5: Fixed-point multiply: hash × G using precomputed table
     FixedPointMultiplyKernel<<<num_blocks, threads_per_block>>>(
-        count, d_hash_scalars, d_fpm_results
+        count, d_hash_scalars, d_fpm_results, state->batch_id
     );
 
     err = cudaDeviceSynchronize();
@@ -804,6 +895,7 @@ extern "C" int RunBatchScanKernels(
     // Step 6: Check matches with label support
     // This will: (1) try base case: output_point + spend_pubkey
     //           (2) for each label: try output_point + label_key (and negated)
+
     CheckMatchesWithLabelsKernel<<<num_blocks, threads_per_block>>>(
         d_fpm_results,
         state->d_spend_pubkey_x,
@@ -815,7 +907,8 @@ extern "C" int RunBatchScanKernels(
         state->d_output_offsets,
         state->d_output_lengths,
         managed_match_flags,
-        count
+        count,
+        state->batch_id
     );
 
     err = cudaDeviceSynchronize();

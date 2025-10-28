@@ -13,6 +13,10 @@
 // CUDA runtime for GPU operations
 #include <cuda_runtime.h>
 
+// Standard library
+#include <map>
+#include <set>
+
 // Declare CUDA functions from cudasp_gpu.cu
 extern "C" {
 	void* LaunchBatchScan(
@@ -81,7 +85,7 @@ static void ConvertScalarToU32(const uint8_t* blob_data, uint32_t* out_scalar) {
 }
 
 struct CudaspScanBindData : public TableFunctionData {
-	CudaspScanBindData() : batch_size(10000) {
+	CudaspScanBindData() : batch_size(10240) {
 	}
 	static constexpr idx_t TWEAK_KEY_SIZE = 64; // 64 bytes: uncompressed EC point (32-byte x || 32-byte y)
 	static constexpr idx_t SCALAR_SIZE = 32; // 32 bytes: scalar for EC multiplication
@@ -105,23 +109,29 @@ struct CudaspScanLocalState : public LocalTableFunctionState {
 	bool finalized;
 
 	// Per-thread accumulated input data
-	vector<string_t> accumulated_txids;        // Transaction IDs (BLOB)
-	vector<int32_t> accumulated_heights;       // Block heights (INTEGER)
-	vector<string_t> accumulated_tweak_keys;   // 64-byte EC points (BLOB)
-	vector<int64_t> accumulated_outputs;       // Flattened output values (BIGINT)
-	vector<idx_t> accumulated_output_offsets;  // Offset into accumulated_outputs for each row
-	vector<idx_t> accumulated_output_lengths;  // Length of each outputs list
+	vector<std::string> accumulated_txids;        // Transaction IDs (BLOB) - owned copies
+	vector<int32_t> accumulated_heights;          // Block heights (INTEGER)
+	vector<std::string> accumulated_tweak_keys;   // 64-byte EC points (BLOB) - owned copies
+	vector<int64_t> accumulated_outputs;          // Flattened output values (BIGINT)
+	vector<idx_t> accumulated_output_offsets;     // Offset into accumulated_outputs for each row
+	vector<idx_t> accumulated_output_lengths;     // Length of each outputs list
 
 	// Per-thread processed output data (only rows with matches)
-	vector<string_t> output_txids;
+	vector<std::string> output_txids;       // Owned copies
 	vector<int32_t> output_heights;
-	vector<string_t> output_tweak_keys;
+	vector<std::string> output_tweak_keys;  // Owned copies
 	idx_t output_position;
 };
 
 struct CudaspScanState : public GlobalTableFunctionState {
 	CudaspScanState() : currently_adding(0) {
 		finalize_lock = make_uniq<std::mutex>();
+	}
+
+	// Limit to single thread to prevent duplicate results from parallel execution
+	// GPU parallelism with thousands of CUDA threads provides sufficient performance
+	idx_t MaxThreads() const override {
+		return 1;
 	}
 
 	// Thread synchronization
@@ -131,6 +141,9 @@ struct CudaspScanState : public GlobalTableFunctionState {
 
 static void AccumulateInput(CudaspScanLocalState &local_state, DataChunk &input) {
 	idx_t count = input.size();
+
+	size_t before_size = local_state.accumulated_heights.size();
+
 	// Expected columns: txid (BLOB), height (INTEGER), tweak_key (BLOB), outputs (LIST[BIGINT])
 	auto &txid_column = input.data[0];
 	auto &height_column = input.data[1];
@@ -171,9 +184,12 @@ static void AccumulateInput(CudaspScanLocalState &local_state, DataChunk &input)
 		    height_data.validity.RowIsValid(height_idx) &&
 		    tweak_key_data.validity.RowIsValid(tweak_key_idx)) {
 
-			local_state.accumulated_txids.push_back(txid_ptr[txid_idx]);
+			// Copy string data to owned storage to avoid dangling pointers when input is cleared
+			auto txid_str = txid_ptr[txid_idx];
+			auto tweak_key_str = tweak_key_ptr[tweak_key_idx];
+			local_state.accumulated_txids.push_back(std::string(txid_str.GetData(), txid_str.GetSize()));
 			local_state.accumulated_heights.push_back(height_ptr[height_idx]);
-			local_state.accumulated_tweak_keys.push_back(tweak_key_ptr[tweak_key_idx]);
+			local_state.accumulated_tweak_keys.push_back(std::string(tweak_key_str.GetData(), tweak_key_str.GetSize()));
 
 			// Store outputs list offset and length
 			idx_t outputs_offset = local_state.accumulated_outputs.size();
@@ -221,7 +237,7 @@ static void ProcessBatch(CudaspScanLocalState &local_state, const CudaspScanBind
 
 	// Convert tweak_keys from BLOB to u32 format (row-major first)
 	for (idx_t i = 0; i < batch_size; i++) {
-		const uint8_t* tweak_data = reinterpret_cast<const uint8_t*>(local_state.accumulated_tweak_keys[i].GetData());
+		const uint8_t* tweak_data = reinterpret_cast<const uint8_t*>(local_state.accumulated_tweak_keys[i].data());
 		ConvertTweakKeyToU32(tweak_data,
 		                     &h_points_x[i * field_limbs],
 		                     &h_points_y[i * field_limbs]);
@@ -293,12 +309,12 @@ static void ProcessBatch(CudaspScanLocalState &local_state, const CudaspScanBind
 	);
 
 	if (state_handle) {
-	    // Write points data directly to managed memory (exactly like gECC's ec_pmul_random_init)
+	    // Write points data directly to managed memory (exactly like gECC's ec_pmul_init)
 #ifdef GECC_QAPW_OPT_COLUMN_MAJORED_INPUTS
 	    // Write in column-major layout directly
 	    for (idx_t j = 0; j < field_limbs; j++) {
 	        for (idx_t i = 0; i < batch_size; i++) {
-	            const uint8_t* tweak_data = reinterpret_cast<const uint8_t*>(local_state.accumulated_tweak_keys[i].GetData());
+	            const uint8_t* tweak_data = reinterpret_cast<const uint8_t*>(local_state.accumulated_tweak_keys[i].data());
 	            uint32_t x_limbs[8], y_limbs[8];
 	            ConvertTweakKeyToU32(tweak_data, x_limbs, y_limbs);
 	            managed_points_x[j * batch_size + i] = x_limbs[j];
@@ -346,12 +362,19 @@ static void ProcessBatch(CudaspScanLocalState &local_state, const CudaspScanBind
 	    );
 
 	    if (kernel_result == 0) {
+	        // Ensure all GPU writes to managed_match_flags are visible to CPU
+	        cudaDeviceSynchronize();
+
 	        // Build output for matching rows
+	        idx_t match_count = 0;
+	        std::vector<int32_t> matched_heights;
 	        for (idx_t i = 0; i < batch_size; i++) {
 	            if (managed_match_flags[i]) {
 	                local_state.output_txids.push_back(local_state.accumulated_txids[i]);
 	                local_state.output_heights.push_back(local_state.accumulated_heights[i]);
 	                local_state.output_tweak_keys.push_back(local_state.accumulated_tweak_keys[i]);
+	                matched_heights.push_back(local_state.accumulated_heights[i]);
+	                match_count++;
 	            }
 	        }
 	    }
@@ -434,8 +457,8 @@ static unique_ptr<FunctionData> CudaspScanBind(ClientContext &context, TableFunc
 		label_keys.push_back(std::string(label_key.GetData(), label_key.GetSize()));
 	}
 
-	// Parse optional batch_size named parameter (default: 10000)
-	idx_t batch_size = 10000;
+	// Parse optional batch_size named parameter (default: 10240)
+	idx_t batch_size = 10240;
 	auto batch_size_entry = input.named_parameters.find("batch_size");
 	if (batch_size_entry != input.named_parameters.end()) {
 		auto &batch_size_value = batch_size_entry->second;
@@ -503,9 +526,11 @@ static OperatorResultType CudaspScanFunction(ExecutionContext &context, TableFun
 		auto tweak_key_data = FlatVector::GetData<string_t>(tweak_key_result);
 
 		for (idx_t i = 0; i < output_count; i++) {
-			txid_data[i] = StringVector::AddStringOrBlob(txid_result, local_state.output_txids[local_state.output_position + i]);
+			auto &txid = local_state.output_txids[local_state.output_position + i];
+			auto &tweak_key = local_state.output_tweak_keys[local_state.output_position + i];
+			txid_data[i] = StringVector::AddStringOrBlob(txid_result, string_t(txid.data(), txid.size()));
 			height_data[i] = local_state.output_heights[local_state.output_position + i];
-			tweak_key_data[i] = StringVector::AddStringOrBlob(tweak_key_result, local_state.output_tweak_keys[local_state.output_position + i]);
+			tweak_key_data[i] = StringVector::AddStringOrBlob(tweak_key_result, string_t(tweak_key.data(), tweak_key.size()));
 		}
 
 		output.SetCardinality(output_count);
@@ -530,6 +555,9 @@ static OperatorResultType CudaspScanFunction(ExecutionContext &context, TableFun
 	if (input.size() > 0) {
 		AccumulateInput(local_state, input);
 
+		// Signal that we've consumed the input
+		input.SetCardinality(0);
+
 		// Process batch if we've accumulated enough data
 		if (ShouldProcessBatch(local_state, bind_data)) {
 			ProcessBatch(local_state, bind_data);
@@ -547,9 +575,11 @@ static OperatorResultType CudaspScanFunction(ExecutionContext &context, TableFun
 			auto tweak_key_data = FlatVector::GetData<string_t>(tweak_key_result);
 
 			for (idx_t i = 0; i < output_count; i++) {
-				txid_data[i] = StringVector::AddStringOrBlob(txid_result, local_state.output_txids[i]);
+				auto &txid = local_state.output_txids[i];
+				auto &tweak_key = local_state.output_tweak_keys[i];
+				txid_data[i] = StringVector::AddStringOrBlob(txid_result, string_t(txid.data(), txid.size()));
 				height_data[i] = local_state.output_heights[i];
-				tweak_key_data[i] = StringVector::AddStringOrBlob(tweak_key_result, local_state.output_tweak_keys[i]);
+				tweak_key_data[i] = StringVector::AddStringOrBlob(tweak_key_result, string_t(tweak_key.data(), tweak_key.size()));
 			}
 
 			output.SetCardinality(output_count);
@@ -587,9 +617,11 @@ static OperatorFinalizeResultType CudaspScanFinalFunction(ExecutionContext &cont
 		auto tweak_key_data = FlatVector::GetData<string_t>(tweak_key_result);
 
 		for (idx_t i = 0; i < output_count; i++) {
-			txid_data[i] = StringVector::AddStringOrBlob(txid_result, local_state.output_txids[local_state.output_position + i]);
+			auto &txid = local_state.output_txids[local_state.output_position + i];
+			auto &tweak_key = local_state.output_tweak_keys[local_state.output_position + i];
+			txid_data[i] = StringVector::AddStringOrBlob(txid_result, string_t(txid.data(), txid.size()));
 			height_data[i] = local_state.output_heights[local_state.output_position + i];
-			tweak_key_data[i] = StringVector::AddStringOrBlob(tweak_key_result, local_state.output_tweak_keys[local_state.output_position + i]);
+			tweak_key_data[i] = StringVector::AddStringOrBlob(tweak_key_result, string_t(tweak_key.data(), tweak_key.size()));
 		}
 
 		output.SetCardinality(output_count);
