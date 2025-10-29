@@ -104,9 +104,10 @@ struct CudaspScanBindData : public TableFunctionData {
 };
 
 struct CudaspScanLocalState : public LocalTableFunctionState {
-	CudaspScanLocalState() : finalized(false), output_position(0) {
+	CudaspScanLocalState() : finalized(false), is_output_thread(false) {
 	}
 	bool finalized;
+	bool is_output_thread;  // True if this thread is responsible for returning output
 
 	// Per-thread accumulated input data
 	vector<std::string> accumulated_txids;        // Transaction IDs (BLOB) - owned copies
@@ -115,28 +116,27 @@ struct CudaspScanLocalState : public LocalTableFunctionState {
 	vector<int64_t> accumulated_outputs;          // Flattened output values (BIGINT)
 	vector<idx_t> accumulated_output_offsets;     // Offset into accumulated_outputs for each row
 	vector<idx_t> accumulated_output_lengths;     // Length of each outputs list
-
-	// Per-thread processed output data (only rows with matches)
-	vector<std::string> output_txids;       // Owned copies
-	vector<int32_t> output_heights;
-	vector<std::string> output_tweak_keys;  // Owned copies
-	idx_t output_position;
 };
 
 struct CudaspScanState : public GlobalTableFunctionState {
-	CudaspScanState() : currently_adding(0) {
+	CudaspScanState() : currently_adding(0), output_position(0), output_thread_claimed(false) {
 		finalize_lock = make_uniq<std::mutex>();
-	}
-
-	// Limit to single thread to prevent duplicate results from parallel execution
-	// GPU parallelism with thousands of CUDA threads provides sufficient performance
-	idx_t MaxThreads() const override {
-		return 1;
+		output_lock = make_uniq<std::mutex>();
 	}
 
 	// Thread synchronization
 	std::atomic_uint64_t currently_adding;
 	unique_ptr<std::mutex> finalize_lock;
+
+	// Global output storage - all threads write here
+	unique_ptr<std::mutex> output_lock;
+	vector<string> output_txids;
+	vector<int32_t> output_heights;
+	vector<string> output_tweak_keys;
+	idx_t output_position;
+
+	// Only one thread returns output to avoid batch index conflicts
+	std::atomic<bool> output_thread_claimed;
 };
 
 static void AccumulateInput(CudaspScanLocalState &local_state, DataChunk &input) {
@@ -211,13 +211,7 @@ static void AccumulateInput(CudaspScanLocalState &local_state, DataChunk &input)
 	}
 }
 
-static void ProcessBatch(CudaspScanLocalState &local_state, const CudaspScanBindData &bind_data) {
-	// Clear any previous output
-	local_state.output_txids.clear();
-	local_state.output_heights.clear();
-	local_state.output_tweak_keys.clear();
-	local_state.output_position = 0;
-
+static void ProcessBatch(CudaspScanLocalState &local_state, const CudaspScanBindData &bind_data, CudaspScanState &global_state) {
 	idx_t batch_size = local_state.accumulated_txids.size();
 	if (batch_size == 0) {
 		return;
@@ -362,21 +356,19 @@ static void ProcessBatch(CudaspScanLocalState &local_state, const CudaspScanBind
 	    );
 
 	    if (kernel_result == 0) {
-	        // Ensure all GPU writes to managed_match_flags are visible to CPU
-	        cudaDeviceSynchronize();
+	        // RunBatchScanKernels already synchronizes the stream before returning
+	        // managed_match_flags is now safe to read from CPU
 
-	        // Build output for matching rows
-	        idx_t match_count = 0;
-	        std::vector<int32_t> matched_heights;
+	        // Build output for matching rows - write to global state with locking
+	        global_state.output_lock->lock();
 	        for (idx_t i = 0; i < batch_size; i++) {
 	            if (managed_match_flags[i]) {
-	                local_state.output_txids.push_back(local_state.accumulated_txids[i]);
-	                local_state.output_heights.push_back(local_state.accumulated_heights[i]);
-	                local_state.output_tweak_keys.push_back(local_state.accumulated_tweak_keys[i]);
-	                matched_heights.push_back(local_state.accumulated_heights[i]);
-	                match_count++;
+	                global_state.output_txids.push_back(local_state.accumulated_txids[i]);
+	                global_state.output_heights.push_back(local_state.accumulated_heights[i]);
+	                global_state.output_tweak_keys.push_back(local_state.accumulated_tweak_keys[i]);
 	            }
 	        }
+	        global_state.output_lock->unlock();
 	    }
 
 	    // Cleanup managed memory
@@ -397,8 +389,8 @@ static void ProcessBatch(CudaspScanLocalState &local_state, const CudaspScanBind
 	local_state.accumulated_output_lengths.clear();
 }
 
-static bool HasOutput(const CudaspScanLocalState &local_state) {
-	return local_state.output_position < local_state.output_txids.size();
+static bool HasOutput(const CudaspScanState &global_state) {
+	return global_state.output_position < global_state.output_txids.size();
 }
 
 static bool ShouldProcessBatch(const CudaspScanLocalState &local_state, const CudaspScanBindData &bind_data) {
@@ -510,90 +502,20 @@ static unique_ptr<LocalTableFunctionState> CudaspScanLocalInit(ExecutionContext 
 static OperatorResultType CudaspScanFunction(ExecutionContext &context, TableFunctionInput &data_p,
                                                     DataChunk &input, DataChunk &output) {
 	auto &bind_data = data_p.bind_data->Cast<CudaspScanBindData>();
+	auto &global_state = data_p.global_state->Cast<CudaspScanState>();
 	auto &local_state = data_p.local_state->Cast<CudaspScanLocalState>();
 
-	// If we have pending output from a previous batch, return it first
-	if (HasOutput(local_state)) {
-		auto &txid_result = output.data[0];
-		auto &height_result = output.data[1];
-		auto &tweak_key_result = output.data[2];
-
-		idx_t output_count = MinValue<idx_t>(STANDARD_VECTOR_SIZE,
-		                                       local_state.output_txids.size() - local_state.output_position);
-
-		auto txid_data = FlatVector::GetData<string_t>(txid_result);
-		auto height_data = FlatVector::GetData<int32_t>(height_result);
-		auto tweak_key_data = FlatVector::GetData<string_t>(tweak_key_result);
-
-		for (idx_t i = 0; i < output_count; i++) {
-			auto &txid = local_state.output_txids[local_state.output_position + i];
-			auto &tweak_key = local_state.output_tweak_keys[local_state.output_position + i];
-			txid_data[i] = StringVector::AddStringOrBlob(txid_result, string_t(txid.data(), txid.size()));
-			height_data[i] = local_state.output_heights[local_state.output_position + i];
-			tweak_key_data[i] = StringVector::AddStringOrBlob(tweak_key_result, string_t(tweak_key.data(), tweak_key.size()));
-		}
-
-		output.SetCardinality(output_count);
-		local_state.output_position += output_count;
-
-		// If we still have more output, signal that
-		if (HasOutput(local_state)) {
-			return OperatorResultType::HAVE_MORE_OUTPUT;
-		}
-
-		// All output returned, clear buffers
-		local_state.output_txids.clear();
-		local_state.output_heights.clear();
-		local_state.output_tweak_keys.clear();
-		local_state.output_position = 0;
-
-		// Otherwise keep accepting input
-		return OperatorResultType::NEED_MORE_INPUT;
-	}
-
-	// Process new input
+	// Accumulate input
 	if (input.size() > 0) {
 		AccumulateInput(local_state, input);
 
-		// Signal that we've consumed the input
-		input.SetCardinality(0);
-
-		// Process batch if we've accumulated enough data
+		// Process batch immediately when full, but don't return output
+		// Output goes to global state for finalize to return
 		if (ShouldProcessBatch(local_state, bind_data)) {
-			ProcessBatch(local_state, bind_data);
-			local_state.output_position = 0;
-
-			// Write output immediately
-			auto &txid_result = output.data[0];
-			auto &height_result = output.data[1];
-			auto &tweak_key_result = output.data[2];
-
-			idx_t output_count = MinValue<idx_t>(STANDARD_VECTOR_SIZE, local_state.output_txids.size());
-
-			auto txid_data = FlatVector::GetData<string_t>(txid_result);
-			auto height_data = FlatVector::GetData<int32_t>(height_result);
-			auto tweak_key_data = FlatVector::GetData<string_t>(tweak_key_result);
-
-			for (idx_t i = 0; i < output_count; i++) {
-				auto &txid = local_state.output_txids[i];
-				auto &tweak_key = local_state.output_tweak_keys[i];
-				txid_data[i] = StringVector::AddStringOrBlob(txid_result, string_t(txid.data(), txid.size()));
-				height_data[i] = local_state.output_heights[i];
-				tweak_key_data[i] = StringVector::AddStringOrBlob(tweak_key_result, string_t(tweak_key.data(), tweak_key.size()));
-			}
-
-			output.SetCardinality(output_count);
-			local_state.output_position = output_count;
-
-			// We just wrote data to output, so we MUST return HAVE_MORE_OUTPUT
-			return OperatorResultType::HAVE_MORE_OUTPUT;
+			ProcessBatch(local_state, bind_data, global_state);
 		}
-
-		// Keep accumulating
-		return OperatorResultType::NEED_MORE_INPUT;
 	}
 
-	// No more input - should not reach here, finalize handles remaining data
 	return OperatorResultType::NEED_MORE_INPUT;
 }
 
@@ -603,39 +525,9 @@ static OperatorFinalizeResultType CudaspScanFinalFunction(ExecutionContext &cont
 	auto &state = data_p.global_state->Cast<CudaspScanState>();
 	auto &local_state = data_p.local_state->Cast<CudaspScanLocalState>();
 
-	// If we still have pending output from previous batch, return it
-	if (HasOutput(local_state)) {
-		auto &txid_result = output.data[0];
-		auto &height_result = output.data[1];
-		auto &tweak_key_result = output.data[2];
-
-		idx_t output_count = MinValue<idx_t>(STANDARD_VECTOR_SIZE,
-		                                       local_state.output_txids.size() - local_state.output_position);
-
-		auto txid_data = FlatVector::GetData<string_t>(txid_result);
-		auto height_data = FlatVector::GetData<int32_t>(height_result);
-		auto tweak_key_data = FlatVector::GetData<string_t>(tweak_key_result);
-
-		for (idx_t i = 0; i < output_count; i++) {
-			auto &txid = local_state.output_txids[local_state.output_position + i];
-			auto &tweak_key = local_state.output_tweak_keys[local_state.output_position + i];
-			txid_data[i] = StringVector::AddStringOrBlob(txid_result, string_t(txid.data(), txid.size()));
-			height_data[i] = local_state.output_heights[local_state.output_position + i];
-			tweak_key_data[i] = StringVector::AddStringOrBlob(tweak_key_result, string_t(tweak_key.data(), tweak_key.size()));
-		}
-
-		output.SetCardinality(output_count);
-		local_state.output_position += output_count;
-
-		if (HasOutput(local_state)) {
-			return OperatorFinalizeResultType::HAVE_MORE_OUTPUT;
-		}
-
-		// Clear output buffers after returning all data
-		local_state.output_txids.clear();
-		local_state.output_heights.clear();
-		local_state.output_tweak_keys.clear();
-		local_state.output_position = 0;
+	// First, process any remaining accumulated data from this thread
+	if (!local_state.finalized && !local_state.accumulated_txids.empty()) {
+		ProcessBatch(local_state, bind_data, state);
 	}
 
 	// Decrement thread counter only once per thread
@@ -646,31 +538,52 @@ static OperatorFinalizeResultType CudaspScanFinalFunction(ExecutionContext &cont
 		state.finalize_lock->unlock();
 	}
 
-	// Process any remaining accumulated data for this thread
-	if (!local_state.accumulated_txids.empty()) {
-		ProcessBatch(local_state, bind_data);
-		local_state.output_position = 0;
+	// If this thread is not the output thread, check if we can become it
+	if (!local_state.is_output_thread) {
+		// Wait for ALL threads to finish processing before claiming output
+		if (state.currently_adding != 0) {
+			return OperatorFinalizeResultType::FINISHED;
+		}
 
+		// Try to claim output responsibility - only one thread should return output
+		// to avoid batch index conflicts in DuckDB
+		bool expected = false;
+		if (!state.output_thread_claimed.compare_exchange_strong(expected, true)) {
+			// Another thread is handling output, we're done
+			return OperatorFinalizeResultType::FINISHED;
+		}
+
+		// We successfully claimed output responsibility
+		local_state.is_output_thread = true;
+	}
+
+	// This thread is responsible for returning all output
+	// All threads have finished processing, so global state is complete
+	// Return output from global state in chunks
+	if (HasOutput(state)) {
 		auto &txid_result = output.data[0];
 		auto &height_result = output.data[1];
 		auto &tweak_key_result = output.data[2];
 
-		idx_t output_count = MinValue<idx_t>(STANDARD_VECTOR_SIZE, local_state.output_txids.size());
+		idx_t output_count = MinValue<idx_t>(STANDARD_VECTOR_SIZE,
+		                                       state.output_txids.size() - state.output_position);
 
 		auto txid_data = FlatVector::GetData<string_t>(txid_result);
 		auto height_data = FlatVector::GetData<int32_t>(height_result);
 		auto tweak_key_data = FlatVector::GetData<string_t>(tweak_key_result);
 
 		for (idx_t i = 0; i < output_count; i++) {
-			txid_data[i] = StringVector::AddStringOrBlob(txid_result, local_state.output_txids[i]);
-			height_data[i] = local_state.output_heights[i];
-			tweak_key_data[i] = StringVector::AddStringOrBlob(tweak_key_result, local_state.output_tweak_keys[i]);
+			auto &txid = state.output_txids[state.output_position + i];
+			auto &tweak_key = state.output_tweak_keys[state.output_position + i];
+			txid_data[i] = StringVector::AddStringOrBlob(txid_result, string_t(txid.data(), txid.size()));
+			height_data[i] = state.output_heights[state.output_position + i];
+			tweak_key_data[i] = StringVector::AddStringOrBlob(tweak_key_result, string_t(tweak_key.data(), tweak_key.size()));
 		}
 
 		output.SetCardinality(output_count);
-		local_state.output_position = output_count;
+		state.output_position += output_count;
 
-		if (HasOutput(local_state)) {
+		if (HasOutput(state)) {
 			return OperatorFinalizeResultType::HAVE_MORE_OUTPUT;
 		}
 	}

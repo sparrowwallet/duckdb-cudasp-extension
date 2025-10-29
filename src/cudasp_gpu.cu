@@ -433,6 +433,7 @@ struct BatchScanState {
     Solver *solver;              // ECDSA solver instance
     uint32_t count;
     uint64_t batch_id;           // Unique batch identifier for debugging
+    cudaStream_t stream;         // CUDA stream for concurrent batch execution
 };
 
 // Host function to initialize solver and prepare for EC multiplication
@@ -478,8 +479,16 @@ extern "C" void* LaunchBatchScan(
     // Generate unique batch ID for debugging (use pointer address as unique ID)
     state->batch_id = reinterpret_cast<uint64_t>(state);
 
-    // Allocate managed memory for point coordinates (caller will fill these)
+    // Create CUDA stream for this batch to enable concurrent execution
     cudaError_t err;
+    err = cudaStreamCreate(&state->stream);
+    if (err != cudaSuccess) {
+        printf("cudaStreamCreate error: %s\n", cudaGetErrorString(err));
+        delete state;
+        return nullptr;
+    }
+
+    // Allocate managed memory for point coordinates (caller will fill these)
     err = cudaMallocManaged(managed_points_x, Field::SIZE * count);
     if (err != cudaSuccess) {
         delete state;
@@ -568,31 +577,24 @@ extern "C" void* LaunchBatchScan(
         return nullptr;
     }
 
-    // Copy outputs metadata using cudaMemcpy to ensure proper coherency
-    // CRITICAL: Use cudaMemcpy instead of memcpy for unified memory to ensure
-    // data is properly synchronized between host and device in concurrent execution
-    err = cudaMemcpy(state->d_outputs, h_outputs, outputs_size * sizeof(int64_t), cudaMemcpyHostToDevice);
+    // Copy outputs metadata using cudaMemcpyAsync with stream for concurrent execution
+    // This allows multiple batches to copy data concurrently without blocking
+    err = cudaMemcpyAsync(state->d_outputs, h_outputs, outputs_size * sizeof(int64_t), cudaMemcpyHostToDevice, state->stream);
     if (err != cudaSuccess) {
-        printf("cudaMemcpy d_outputs error: %s\n", cudaGetErrorString(err));
+        printf("cudaMemcpyAsync d_outputs error: %s\n", cudaGetErrorString(err));
     }
-    err = cudaMemcpy(state->d_output_offsets, h_output_offsets, count * sizeof(uint32_t), cudaMemcpyHostToDevice);
+    err = cudaMemcpyAsync(state->d_output_offsets, h_output_offsets, count * sizeof(uint32_t), cudaMemcpyHostToDevice, state->stream);
     if (err != cudaSuccess) {
-        printf("cudaMemcpy d_output_offsets error: %s\n", cudaGetErrorString(err));
+        printf("cudaMemcpyAsync d_output_offsets error: %s\n", cudaGetErrorString(err));
     }
-    err = cudaMemcpy(state->d_output_lengths, h_output_lengths, count * sizeof(uint32_t), cudaMemcpyHostToDevice);
+    err = cudaMemcpyAsync(state->d_output_lengths, h_output_lengths, count * sizeof(uint32_t), cudaMemcpyHostToDevice, state->stream);
     if (err != cudaSuccess) {
-        printf("cudaMemcpy d_output_lengths error: %s\n", cudaGetErrorString(err));
-    }
-
-    // Synchronize to ensure all data is copied to device before returning
-    err = cudaDeviceSynchronize();
-    if (err != cudaSuccess) {
-        printf("cudaDeviceSynchronize after memcpy error: %s\n", cudaGetErrorString(err));
+        printf("cudaMemcpyAsync d_output_lengths error: %s\n", cudaGetErrorString(err));
     }
 
     // Copy spend public key
-    cudaMemcpy(state->d_spend_pubkey_x, h_spend_pubkey_x, field_limbs * sizeof(uint32_t), cudaMemcpyHostToDevice);
-    cudaMemcpy(state->d_spend_pubkey_y, h_spend_pubkey_y, field_limbs * sizeof(uint32_t), cudaMemcpyHostToDevice);
+    cudaMemcpyAsync(state->d_spend_pubkey_x, h_spend_pubkey_x, field_limbs * sizeof(uint32_t), cudaMemcpyHostToDevice, state->stream);
+    cudaMemcpyAsync(state->d_spend_pubkey_y, h_spend_pubkey_y, field_limbs * sizeof(uint32_t), cudaMemcpyHostToDevice, state->stream);
 
     // Allocate and copy label keys (if any)
     if (label_count > 0) {
@@ -625,8 +627,8 @@ extern "C" void* LaunchBatchScan(
             return nullptr;
         }
 
-        cudaMemcpy(state->d_label_keys_x, h_label_keys_x, label_count * field_limbs * sizeof(uint32_t), cudaMemcpyHostToDevice);
-        cudaMemcpy(state->d_label_keys_y, h_label_keys_y, label_count * field_limbs * sizeof(uint32_t), cudaMemcpyHostToDevice);
+        cudaMemcpyAsync(state->d_label_keys_x, h_label_keys_x, label_count * field_limbs * sizeof(uint32_t), cudaMemcpyHostToDevice, state->stream);
+        cudaMemcpyAsync(state->d_label_keys_y, h_label_keys_y, label_count * field_limbs * sizeof(uint32_t), cudaMemcpyHostToDevice, state->stream);
     }
 
     // Create fresh solver for this batch
@@ -657,8 +659,6 @@ extern "C" int RunBatchScanKernels(
     }
 
     Solver *solver = state->solver;
-
-    cudaDeviceSynchronize();
 
     // Prepare data in the format expected by ec_pmul_init
     // MAX_LIMBS is defined in gECC as 64 (maximum array size)
@@ -721,8 +721,8 @@ extern "C" int RunBatchScanKernels(
         }
     #endif
 
-    // Call ec_pmul_init with our specific data
-    solver->ec_pmul_init(h_scalars, h_keys_x, h_keys_y, count);
+    // Call ec_pmul_init with our specific data and stream
+    solver->ec_pmul_init(h_scalars, h_keys_x, h_keys_y, count, state->stream);
 
     // Free host arrays
     delete[] h_scalars;
@@ -742,7 +742,7 @@ extern "C" int RunBatchScanKernels(
     u32 max_thread_per_block = 256;
     u32 block_num = MAX_SM_NUMS;  // Use SM count like gECC test for optimal occupancy
 
-    solver->ecdsa_ec_pmul(block_num, max_thread_per_block, true);  // true = unknown points
+    solver->ecdsa_ec_pmul(block_num, max_thread_per_block, true, state->stream);  // true = unknown points
 
     // Check for multiplication errors
     err = cudaPeekAtLastError();
@@ -751,7 +751,7 @@ extern "C" int RunBatchScanKernels(
         return -1;
     }
 
-    cudaDeviceSynchronize();
+    // ecdsa_ec_pmul() already synchronizes internally, no need to sync again
 
     // === BIP-352 Silent Payment Pipeline ===
     // Step 1: Serialize shared secrets to compressed SEC1 format + 4 zero bytes (37 bytes each)
@@ -767,11 +767,11 @@ extern "C" int RunBatchScanKernels(
     // Kernels will process multiple elements per thread when count > blocks * threads
     int num_blocks = MAX_SM_NUMS;  // Use SM count for good occupancy
 
-    SerializeToCompressedSEC1Kernel<<<num_blocks, threads_per_block>>>(
+    SerializeToCompressedSEC1Kernel<<<num_blocks, threads_per_block, 0, state->stream>>>(
         solver->R0, d_serialized, count, state->batch_id
     );
 
-    err = cudaDeviceSynchronize();
+    err = cudaStreamSynchronize(state->stream);
     if (err != cudaSuccess) {
         printf("SerializeToCompressedSEC1Kernel error: %s\n", cudaGetErrorString(err));
         cudaFree(d_serialized);
@@ -787,32 +787,35 @@ extern "C" int RunBatchScanKernels(
         return -1;
     }
 
-    ComputeTaggedHashesKernel<<<num_blocks, threads_per_block>>>(
+    ComputeTaggedHashesKernel<<<num_blocks, threads_per_block, 0, state->stream>>>(
         d_serialized, d_hashes, count, state->batch_id
     );
 
-    err = cudaDeviceSynchronize();
+    // Step 3: Copy hashes to host and convert to Order scalars for fixed-point multiplication
+    // Copy hashes to host memory first to avoid coherency issues
+    // Use async memcpy with stream, then sync the stream
+    uint8_t *h_hashes = new uint8_t[count * 32];
+    err = cudaMemcpyAsync(h_hashes, d_hashes, count * 32, cudaMemcpyDeviceToHost, state->stream);
     if (err != cudaSuccess) {
-        printf("ComputeTaggedHashesKernel error: %s\n", cudaGetErrorString(err));
+        printf("cudaMemcpyAsync for h_hashes error: %s\n", cudaGetErrorString(err));
         cudaFree(d_serialized);
         cudaFree(d_hashes);
+        delete[] h_hashes;
         return -1;
     }
 
-    // Debug: Log hash result
-    cudaFree(d_serialized);  // No longer needed
-
-    // Step 3: Convert hashes to Order scalars for fixed-point multiplication
-    // Copy hashes to host memory first to avoid coherency issues
-    uint8_t *h_hashes = new uint8_t[count * 32];
-    err = cudaMemcpy(h_hashes, d_hashes, count * 32, cudaMemcpyDeviceToHost);
+    err = cudaStreamSynchronize(state->stream);
     if (err != cudaSuccess) {
-        printf("cudaMemcpy for h_hashes error: %s\n", cudaGetErrorString(err));
+        printf("cudaStreamSynchronize after memcpy error: %s\n", cudaGetErrorString(err));
+        cudaFree(d_serialized);
         cudaFree(d_hashes);
+        delete[] h_hashes;
         return -1;
     }
 
-    cudaFree(d_hashes);  // No longer needed
+    // Free device memory after memcpy completes
+    cudaFree(d_serialized);
+    cudaFree(d_hashes);
 
     // Allocate host buffer for conversion
     Order::Base *h_hash_scalars = new Order::Base[Order::SIZE * count];
@@ -858,15 +861,15 @@ extern "C" int RunBatchScanKernels(
         return -1;
     }
 
-    err = cudaMemcpy(d_hash_scalars, h_hash_scalars, Order::SIZE * count, cudaMemcpyHostToDevice);
+    err = cudaMemcpyAsync(d_hash_scalars, h_hash_scalars, Order::SIZE * count, cudaMemcpyHostToDevice, state->stream);
     if (err != cudaSuccess) {
-        printf("cudaMemcpy for d_hash_scalars error: %s\n", cudaGetErrorString(err));
+        printf("cudaMemcpyAsync for d_hash_scalars error: %s\n", cudaGetErrorString(err));
         delete[] h_hash_scalars;
         cudaFree(d_hash_scalars);
         return -1;
     }
 
-    delete[] h_hash_scalars;  // No longer needed
+    delete[] h_hash_scalars;  // Can be freed after async copy is queued
 
     // Step 4: Allocate output buffer for fixed-point multiply results
     ECPoint::Base *d_fpm_results;
@@ -878,11 +881,11 @@ extern "C" int RunBatchScanKernels(
     }
 
     // Step 5: Fixed-point multiply: hash × G using precomputed table
-    FixedPointMultiplyKernel<<<num_blocks, threads_per_block>>>(
+    FixedPointMultiplyKernel<<<num_blocks, threads_per_block, 0, state->stream>>>(
         count, d_hash_scalars, d_fpm_results, state->batch_id
     );
 
-    err = cudaDeviceSynchronize();
+    err = cudaStreamSynchronize(state->stream);
     if (err != cudaSuccess) {
         printf("FixedPointMultiplyKernel error: %s\n", cudaGetErrorString(err));
         cudaFree(d_hash_scalars);
@@ -896,7 +899,7 @@ extern "C" int RunBatchScanKernels(
     // This will: (1) try base case: output_point + spend_pubkey
     //           (2) for each label: try output_point + label_key (and negated)
 
-    CheckMatchesWithLabelsKernel<<<num_blocks, threads_per_block>>>(
+    CheckMatchesWithLabelsKernel<<<num_blocks, threads_per_block, 0, state->stream>>>(
         d_fpm_results,
         state->d_spend_pubkey_x,
         state->d_spend_pubkey_y,
@@ -911,7 +914,7 @@ extern "C" int RunBatchScanKernels(
         state->batch_id
     );
 
-    err = cudaDeviceSynchronize();
+    err = cudaStreamSynchronize(state->stream);
     if (err != cudaSuccess) {
         printf("CheckMatchesWithLabelsKernel error: %s\n", cudaGetErrorString(err));
         cudaFree(d_fpm_results);
@@ -929,6 +932,24 @@ extern "C" void FreeBatchScanState(void *state_handle) {
 
     BatchScanState *state = static_cast<BatchScanState*>(state_handle);
 
+    // CRITICAL: Synchronize stream before cleanup to ensure all operations complete
+    // Without this, destroying the stream or freeing memory can cause deadlocks
+    if (state->stream) {
+        cudaError_t sync_err = cudaStreamSynchronize(state->stream);
+        if (sync_err != cudaSuccess) {
+            printf("WARNING: cudaStreamSynchronize in FreeBatchScanState failed: %s\n", cudaGetErrorString(sync_err));
+        }
+
+        // Double-check stream is idle
+        cudaError_t query_err = cudaStreamQuery(state->stream);
+        if (query_err == cudaErrorNotReady) {
+            printf("WARNING: Stream not ready after synchronize, forcing device sync\n");
+            cudaDeviceSynchronize();
+        } else if (query_err != cudaSuccess) {
+            printf("WARNING: cudaStreamQuery failed: %s\n", cudaGetErrorString(query_err));
+        }
+    }
+
     // Free CUDA buffers
     if (state->d_outputs) cudaFree(state->d_outputs);
     if (state->d_output_offsets) cudaFree(state->d_output_offsets);
@@ -939,8 +960,16 @@ extern "C" void FreeBatchScanState(void *state_handle) {
     if (state->d_label_keys_y) cudaFree(state->d_label_keys_y);
     if (state->d_fpm_results_backup) cudaFree(state->d_fpm_results_backup);
 
-    // Delete solver
-    if (state->solver) delete state->solver;
+    // Clean up solver resources (frees managed memory allocated in ec_pmul_init)
+    if (state->solver) {
+        state->solver->ec_pmul_close();
+        delete state->solver;
+    }
+
+    // Destroy CUDA stream (safe now after synchronization)
+    if (state->stream) {
+        cudaStreamDestroy(state->stream);
+    }
 
     // Free state struct
     delete state;
