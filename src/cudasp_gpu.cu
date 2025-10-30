@@ -1,5 +1,7 @@
 #include <cuda_runtime.h>
 #include <cstdint>
+#include <mutex>
+#include <set>
 
 #include "gecc.h"
 #include "gecc/arith.h"
@@ -434,6 +436,7 @@ struct BatchScanState {
     uint32_t count;
     uint64_t batch_id;           // Unique batch identifier for debugging
     cudaStream_t stream;         // CUDA stream for concurrent batch execution
+    int device_id;               // GPU device ID where this batch was created
 };
 
 // Host function to initialize solver and prepare for EC multiplication
@@ -455,12 +458,30 @@ extern "C" void* LaunchBatchScan(
     uint32_t count,
     size_t outputs_size) {
 
-    // Initialize field and solver once per program (not per batch)
+    // Store current device ID for multi-GPU support
+    // All CUDA operations for this batch must happen on this device
+    cudaError_t err;
+    int device_id;
+    err = cudaGetDevice(&device_id);
+    if (err != cudaSuccess) {
+        printf("cudaGetDevice error: %s\n", cudaGetErrorString(err));
+        return nullptr;
+    }
+
+    // Initialize Solver once per GPU device (not just once globally)
+    // Use static map to track which devices have been initialized
     // Use C++11 static initialization guarantee for thread safety
-    static bool initialized = []() {
-        Solver::initialize();
-        return true;
-    }();
+    static std::mutex init_mutex;
+    static std::set<int> initialized_devices;
+
+    {
+        std::lock_guard<std::mutex> lock(init_mutex);
+        if (initialized_devices.find(device_id) == initialized_devices.end()) {
+            // First time using this device - initialize it
+            Solver::initialize();
+            initialized_devices.insert(device_id);
+        }
+    }
 
     // Allocate per-batch state (thread-safe)
     BatchScanState *state = new BatchScanState();
@@ -475,12 +496,12 @@ extern "C" void* LaunchBatchScan(
     state->label_count = label_count;
     state->solver = nullptr;
     state->count = count;
+    state->device_id = device_id;
 
     // Generate unique batch ID for debugging (use pointer address as unique ID)
     state->batch_id = reinterpret_cast<uint64_t>(state);
 
     // Create CUDA stream for this batch to enable concurrent execution
-    cudaError_t err;
     err = cudaStreamCreate(&state->stream);
     if (err != cudaSuccess) {
         printf("cudaStreamCreate error: %s\n", cudaGetErrorString(err));
@@ -655,6 +676,14 @@ extern "C" int RunBatchScanKernels(
     BatchScanState *state = static_cast<BatchScanState*>(state_handle);
     if (!state || !state->solver) {
         printf("Error: Invalid state or solver not initialized\n");
+        return -1;
+    }
+
+    // Ensure we're on the correct device for this batch (multi-GPU support)
+    cudaError_t device_err = cudaSetDevice(state->device_id);
+    if (device_err != cudaSuccess) {
+        printf("Error: Failed to set device %d in RunBatchScanKernels: %s\n",
+               state->device_id, cudaGetErrorString(device_err));
         return -1;
     }
 
@@ -931,6 +960,14 @@ extern "C" void FreeBatchScanState(void *state_handle) {
     if (!state_handle) return;
 
     BatchScanState *state = static_cast<BatchScanState*>(state_handle);
+
+    // CRITICAL: Set correct device for multi-GPU support
+    // All CUDA cleanup operations must happen on the device where resources were allocated
+    cudaError_t device_err = cudaSetDevice(state->device_id);
+    if (device_err != cudaSuccess) {
+        printf("WARNING: Failed to set device %d in FreeBatchScanState: %s\n",
+               state->device_id, cudaGetErrorString(device_err));
+    }
 
     // CRITICAL: Synchronize stream before cleanup to ensure all operations complete
     // Without this, destroying the stream or freeing memory can cause deadlocks

@@ -104,10 +104,11 @@ struct CudaspScanBindData : public TableFunctionData {
 };
 
 struct CudaspScanLocalState : public LocalTableFunctionState {
-	CudaspScanLocalState() : finalized(false), is_output_thread(false) {
+	CudaspScanLocalState() : finalized(false), is_output_thread(false), assigned_gpu(-1) {
 	}
 	bool finalized;
 	bool is_output_thread;  // True if this thread is responsible for returning output
+	int assigned_gpu;       // GPU device ID assigned to this thread (-1 = not assigned)
 
 	// Per-thread accumulated input data
 	vector<std::string> accumulated_txids;        // Transaction IDs (BLOB) - owned copies
@@ -119,9 +120,16 @@ struct CudaspScanLocalState : public LocalTableFunctionState {
 };
 
 struct CudaspScanState : public GlobalTableFunctionState {
-	CudaspScanState() : currently_adding(0), output_position(0), output_thread_claimed(false) {
+	CudaspScanState() : currently_adding(0), output_position(0), output_thread_claimed(false),
+	                    num_gpus(0), next_gpu_assignment(0) {
 		finalize_lock = make_uniq<std::mutex>();
 		output_lock = make_uniq<std::mutex>();
+
+		// Detect number of available GPUs
+		cudaError_t err = cudaGetDeviceCount(&num_gpus);
+		if (err != cudaSuccess || num_gpus == 0) {
+			num_gpus = 1;  // Fallback to single GPU
+		}
 	}
 
 	// Thread synchronization
@@ -137,6 +145,10 @@ struct CudaspScanState : public GlobalTableFunctionState {
 
 	// Only one thread returns output to avoid batch index conflicts
 	std::atomic<bool> output_thread_claimed;
+
+	// Multi-GPU support
+	int num_gpus;                      // Number of available GPUs
+	std::atomic<int> next_gpu_assignment;  // Round-robin GPU assignment counter
 };
 
 static void AccumulateInput(CudaspScanLocalState &local_state, DataChunk &input) {
@@ -215,6 +227,14 @@ static void ProcessBatch(CudaspScanLocalState &local_state, const CudaspScanBind
 	idx_t batch_size = local_state.accumulated_txids.size();
 	if (batch_size == 0) {
 		return;
+	}
+
+	// Set CUDA device for this thread's assigned GPU
+	// All subsequent CUDA operations will use this device
+	cudaError_t err = cudaSetDevice(local_state.assigned_gpu);
+	if (err != cudaSuccess) {
+		throw InvalidInputException("Failed to set CUDA device %d: %s",
+		                            local_state.assigned_gpu, cudaGetErrorString(err));
 	}
 
 	// Prepare host data for GPU
@@ -489,14 +509,26 @@ static unique_ptr<FunctionData> CudaspScanBind(ClientContext &context, TableFunc
 }
 
 static unique_ptr<GlobalTableFunctionState> CudaspScanInit(ClientContext &context, TableFunctionInitInput &input) {
-	return make_uniq<CudaspScanState>();
+	auto state = make_uniq<CudaspScanState>();
+	return state;
 }
 
 static unique_ptr<LocalTableFunctionState> CudaspScanLocalInit(ExecutionContext &context, TableFunctionInitInput &input,
                                                                       GlobalTableFunctionState *global_state) {
 	auto &state = global_state->Cast<CudaspScanState>();
 	state.currently_adding++;
-	return make_uniq<CudaspScanLocalState>();
+
+	auto local_state = make_uniq<CudaspScanLocalState>();
+
+	// Assign GPU to this thread using round-robin distribution
+	// This ensures each thread consistently uses the same GPU for all its batches
+	if (state.num_gpus > 1) {
+		local_state->assigned_gpu = state.next_gpu_assignment.fetch_add(1) % state.num_gpus;
+	} else {
+		local_state->assigned_gpu = 0;  // Single GPU - use device 0
+	}
+
+	return local_state;
 }
 
 static OperatorResultType CudaspScanFunction(ExecutionContext &context, TableFunctionInput &data_p,
