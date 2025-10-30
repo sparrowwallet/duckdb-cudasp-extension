@@ -85,7 +85,7 @@ static void ConvertScalarToU32(const uint8_t* blob_data, uint32_t* out_scalar) {
 }
 
 struct CudaspScanBindData : public TableFunctionData {
-	CudaspScanBindData() : batch_size(10240) {
+	CudaspScanBindData() : batch_size(300000) {
 	}
 	static constexpr idx_t TWEAK_KEY_SIZE = 64; // 64 bytes: uncompressed EC point (32-byte x || 32-byte y)
 	static constexpr idx_t SCALAR_SIZE = 32; // 32 bytes: scalar for EC multiplication
@@ -469,8 +469,8 @@ static unique_ptr<FunctionData> CudaspScanBind(ClientContext &context, TableFunc
 		label_keys.push_back(std::string(label_key.GetData(), label_key.GetSize()));
 	}
 
-	// Parse optional batch_size named parameter (default: 10240)
-	idx_t batch_size = 10240;
+	// Parse optional batch_size named parameter (default: 300000)
+	idx_t batch_size = 300000;
 	auto batch_size_entry = input.named_parameters.find("batch_size");
 	if (batch_size_entry != input.named_parameters.end()) {
 		auto &batch_size_value = batch_size_entry->second;
