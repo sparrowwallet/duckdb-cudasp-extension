@@ -83,8 +83,14 @@ target_link_libraries(${LOADABLE_EXTENSION_NAME} OpenSSL::SSL OpenSSL::Crypto CU
 # Set CUDA-specific compile options
 set_source_files_properties(src/cudasp_extension.cu PROPERTIES LANGUAGE CUDA)
 set_source_files_properties(src/cudasp_gpu.cu PROPERTIES LANGUAGE CUDA)
-target_compile_options(${EXTENSION_NAME} PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:--expt-relaxed-constexpr>)
-target_compile_options(${LOADABLE_EXTENSION_NAME} PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:--expt-relaxed-constexpr>)
+target_compile_options(${EXTENSION_NAME} PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:
+    --expt-relaxed-constexpr
+    -diag-suppress=940  # Suppress false-positive "missing return statement" warnings from gECC library
+>)
+target_compile_options(${LOADABLE_EXTENSION_NAME} PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:
+    --expt-relaxed-constexpr
+    -diag-suppress=940  # Suppress false-positive "missing return statement" warnings from gECC library
+>)
 
 install(
   TARGETS ${EXTENSION_NAME}

@@ -432,7 +432,7 @@ struct BatchScanState {
     uint32_t *d_label_keys_y;    // Device memory for label keys Y (label_count * 8 u32 limbs)
     uint32_t *d_fpm_results_backup;  // Backup of FPM results before adding spend_pubkey (for label checking)
     uint32_t label_count;        // Number of label keys
-    Solver *solver;              // ECDSA solver instance
+    ECDSA_Solver *solver;        // ECDSA solver instance (use full type name to avoid internal linkage warning)
     uint32_t count;
     uint64_t batch_id;           // Unique batch identifier for debugging
     cudaStream_t stream;         // CUDA stream for concurrent batch execution
