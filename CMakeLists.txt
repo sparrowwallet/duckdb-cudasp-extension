@@ -22,8 +22,8 @@ include_directories(src/include)
 include_directories(gECC/include)
 
 # Set CUDA architecture (adjust based on your GPU)
-# Common values: 75 (Turing), 80 (Ampere), 86 (RTX 30xx), 89 (RTX 40xx)
-set(CMAKE_CUDA_ARCHITECTURES 80 86 89)
+# Common values: 75 (Turing), 80 (Ampere), 86 (RTX 30xx), 89 (RTX 40xx), 90 (Hopper H100/H200)
+set(CMAKE_CUDA_ARCHITECTURES 80 86 89 90)
 
 # Enable gECC optimizations
 add_compile_definitions(GECC_QAPW_OPT_COLUMN_MAJORED_INPUTS)
