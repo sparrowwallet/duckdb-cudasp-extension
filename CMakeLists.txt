@@ -77,8 +77,9 @@ add_dependencies(${EXTENSION_NAME} gecc_constants)
 add_dependencies(${LOADABLE_EXTENSION_NAME} gecc_constants)
 
 # Link OpenSSL and CUDA in both the static library and the loadable extension
-target_link_libraries(${EXTENSION_NAME} OpenSSL::SSL OpenSSL::Crypto CUDA::cudart)
-target_link_libraries(${LOADABLE_EXTENSION_NAME} OpenSSL::SSL OpenSSL::Crypto CUDA::cudart)
+# Use static CUDA runtime to avoid version-specific libcudart.so dependencies
+target_link_libraries(${EXTENSION_NAME} OpenSSL::SSL OpenSSL::Crypto CUDA::cudart_static)
+target_link_libraries(${LOADABLE_EXTENSION_NAME} OpenSSL::SSL OpenSSL::Crypto CUDA::cudart_static)
 
 # Set CUDA-specific compile options
 set_source_files_properties(src/cudasp_extension.cu PROPERTIES LANGUAGE CUDA)
