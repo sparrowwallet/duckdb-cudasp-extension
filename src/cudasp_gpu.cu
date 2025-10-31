@@ -512,6 +512,7 @@ extern "C" void* LaunchBatchScan(
     // Allocate managed memory for point coordinates (caller will fill these)
     err = cudaMallocManaged(managed_points_x, Field::SIZE * count);
     if (err != cudaSuccess) {
+        cudaStreamDestroy(state->stream);
         delete state;
         return nullptr;
     }
@@ -519,6 +520,7 @@ extern "C" void* LaunchBatchScan(
     err = cudaMallocManaged(managed_points_y, Field::SIZE * count);
     if (err != cudaSuccess) {
         cudaFree(*managed_points_x);
+        cudaStreamDestroy(state->stream);
         delete state;
         return nullptr;
     }
@@ -530,6 +532,7 @@ extern "C" void* LaunchBatchScan(
     if (err != cudaSuccess) {
         cudaFree(*managed_points_x);
         cudaFree(*managed_points_y);
+        cudaStreamDestroy(state->stream);
         delete state;
         return nullptr;
     }
@@ -539,6 +542,7 @@ extern "C" void* LaunchBatchScan(
         cudaFree(*managed_points_x);
         cudaFree(*managed_points_y);
         cudaFree(state->d_outputs);
+        cudaStreamDestroy(state->stream);
         delete state;
         return nullptr;
     }
@@ -551,6 +555,7 @@ extern "C" void* LaunchBatchScan(
         cudaFree(*managed_points_y);
         cudaFree(state->d_outputs);
         cudaFree(state->d_output_offsets);
+        cudaStreamDestroy(state->stream);
         delete state;
         return nullptr;
     }
@@ -564,6 +569,7 @@ extern "C" void* LaunchBatchScan(
         cudaFree(state->d_outputs);
         cudaFree(state->d_output_offsets);
         cudaFree(state->d_output_lengths);
+        cudaStreamDestroy(state->stream);
         delete state;
         return nullptr;
     }
@@ -581,6 +587,7 @@ extern "C" void* LaunchBatchScan(
         cudaFree(state->d_output_offsets);
         cudaFree(state->d_output_lengths);
         cudaFree(*managed_match_flags);
+        cudaStreamDestroy(state->stream);
         delete state;
         return nullptr;
     }
@@ -594,6 +601,7 @@ extern "C" void* LaunchBatchScan(
         cudaFree(state->d_output_lengths);
         cudaFree(*managed_match_flags);
         cudaFree(state->d_spend_pubkey_x);
+        cudaStreamDestroy(state->stream);
         delete state;
         return nullptr;
     }
@@ -629,6 +637,7 @@ extern "C" void* LaunchBatchScan(
             cudaFree(*managed_match_flags);
             cudaFree(state->d_spend_pubkey_x);
             cudaFree(state->d_spend_pubkey_y);
+            cudaStreamDestroy(state->stream);
             delete state;
             return nullptr;
         }
@@ -644,6 +653,7 @@ extern "C" void* LaunchBatchScan(
             cudaFree(state->d_spend_pubkey_x);
             cudaFree(state->d_spend_pubkey_y);
             cudaFree(state->d_label_keys_x);
+            cudaStreamDestroy(state->stream);
             delete state;
             return nullptr;
         }
