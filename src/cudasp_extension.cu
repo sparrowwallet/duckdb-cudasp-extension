@@ -505,12 +505,12 @@ static unique_ptr<FunctionData> CudaspScanBind(ClientContext &context, TableFunc
 	bind_data->label_keys_data = std::move(label_keys);
 	// Set batch size
 	bind_data->batch_size = batch_size;
-	return bind_data;
+	return duckdb::unique_ptr<FunctionData>(bind_data.release());
 }
 
 static unique_ptr<GlobalTableFunctionState> CudaspScanInit(ClientContext &context, TableFunctionInitInput &input) {
 	auto state = make_uniq<CudaspScanState>();
-	return state;
+	return duckdb::unique_ptr<GlobalTableFunctionState>(state.release());
 }
 
 static unique_ptr<LocalTableFunctionState> CudaspScanLocalInit(ExecutionContext &context, TableFunctionInitInput &input,
@@ -528,7 +528,7 @@ static unique_ptr<LocalTableFunctionState> CudaspScanLocalInit(ExecutionContext 
 		local_state->assigned_gpu = 0;  // Single GPU - use device 0
 	}
 
-	return local_state;
+	return duckdb::unique_ptr<LocalTableFunctionState>(local_state.release());
 }
 
 static OperatorResultType CudaspScanFunction(ExecutionContext &context, TableFunctionInput &data_p,
